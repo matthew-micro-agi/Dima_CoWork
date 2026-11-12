@@ -20,7 +20,9 @@ configure_file(src/common/fwt_version.h.in
                ${CMAKE_BINARY_DIR}/generated/fwt_version.h @ONLY)
 
 add_subdirectory(src/common)
+add_subdirectory(src/trigd)
 add_subdirectory(src/tools/fwt-info)
+add_subdirectory(src/tools/trig-listen)
 
 # Unit tests run on the laptop only (not when cross-compiling).
 if(NOT CMAKE_CROSSCOMPILING)

@@ -1,5 +1,6 @@
 add_library(fwt_common STATIC
   fwt_index.c
+  fwt_seqcheck.c
 )
 
 target_include_directories(fwt_common PUBLIC
