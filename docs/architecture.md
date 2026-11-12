@@ -13,6 +13,8 @@ This document describes **our node as implemented on the TI J722S EVM**: our cam
 
 Interchangeability with other node implementations is defined in §8 as a set of requirements, not as shared code.
 
+Why each choice was made, the alternatives and dead ends: `decision-log.md` (DL-xx references below).
+
 ---
 
 ## 1. Summary
@@ -97,11 +99,24 @@ trigger-driven test source (now) │ AR023x -> CSI2RX3 -> v4l2src -> tiovxisp (c
       -> our code: SEI {session, index, t} + drop check -> recorder -> eMMC
 ```
 
-**GStreamer** is the media framework [TI elements, standard framework]:
+**GStreamer** is the media framework [TI elements, standard framework] (DL-08):
 - **Now:** a thin pipeline; our code sits at `appsrc` (one frame per trigger edge) and `appsink`.
 - **Later:** the same logic wrapped as our own elements (`trigsrc`, `trigsei`, `segmentsink`), so the whole node is one portable pipeline. On Rockchip only the middle changes (`mpph265enc`).
 - Logic is written as plain functions (SEI building, drop check, segment/manifest writing) so it can be wrapped without rewriting.
-- The trigger PHC time is carried as the buffer timestamp through the encoder *(verify Wave5 keeps it 1:1 per frame)*.
+- The trigger PHC time is carried as the buffer timestamp through the encoder. Measured (P-1): Wave5 passes timestamps through for almost all frames, but lost one and repeated one at stream start, so it is **checked at the encoder output** (§4.4), never trusted blindly.
+
+**Mandatory encoder settings** (measured in P-1, `v4l2h265enc extra-controls`):
+
+| Control | Value | Why |
+|---|---|---|
+| `frame_level_rate_control_enable` | 1 | default 0 = rate control off: bitrate is ignored (fixed QP) |
+| `video_bitrate`, `video_bitrate_mode` | per AC §2, CBR | bitrate target |
+| `video_gop_size` | = fps | keyframe every 1 s |
+| `prepend_sps_and_pps_to_idr` | 1 | default 0; headers before every keyframe, so every 4 s segment decodes on its own (verified) |
+| `hevc_level` | 5 | 1920x1200 exceeds level 4.1; the default signals a wrong level *(verify)* |
+| input caps | `colorimetry=bt709` | the encoder rejects buffer sources without explicit colorimetry |
+
+Measured capacity: **~100 fps at 1920x1200** (need 60). Bitrate on noise (worst case) ~2x the target; real content to be measured with a camera. The test source pushes pre-made buffers: rendering per frame (`videotestsrc`) costs a full core at 10-40 fps.
 
 | Stage | Format | Rate (1920x1200) |
 |---|---|---|
@@ -119,7 +134,8 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 ### 4.1 Trigger generation in hardware [TI + EVM]
 
 - `trigd` (C) makes one request: a CPTS periodic output (GENF) starting at **T0**, period `1/fps` (standard Linux PTP `PTP_PEROUT_REQUEST`). **The CPTS fires every edge in hardware** on PTP time. Linux scheduling cannot delay or shift an edge.
-- Each edge is **timestamped in hardware** on a CPTS input (HW_TS_PUSH). On the EVM, GENF1 -> HW3_TS_PUSH is already routed (`ti,pps = <2 1>`), so timestamps need no extra wiring. `trigd` reads them via `PTP_EXTTS_REQUEST`. A late read delays *when* we learn an edge, never *what time* it carries.
+- Each edge is **timestamped in hardware** on a CPTS input (HW_TS_PUSH), routed from GENF1 to HW3_TS_PUSH through the timesync router. `trigd` reads them via `PTP_EXTTS_REQUEST`. A late read delays *when* we learn an edge, never *what time* it carries. On the current image this route is missing; see gap G1 (§11.6).
+- The CPTS runs at 500 MHz: 2 ns timestamp resolution. A periodic output keeps running after its file descriptor closes, so `trigd` disables it explicitly on stop.
 - When `ptp4l` adjusts the clock, the CPTS adjusts the edge frequency in hardware: edges stay locked to network time.
 - **Route to the sensor:** GENF -> pin mux (our overlay) -> SoC pad GPMC0_AD7 -> J1 pin 18 -> module -> sensor trigger input.
   - **Open:** can GENF (or a timer output) be muxed onto GPMC0_AD7? *(verify in the J722S pin mux table.)* If yes, it's an overlay only. If only a DMTimer output is available, discipline it from PTP via the timesync router. If neither, a jumper wire from a GENF-capable pad (ask Matthew).
@@ -127,9 +143,10 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ### 4.2 Time base
 
-- PHC (/dev/ptp0) is the reference; `ptp4l` (gPTP profile) on eth0, `phc2sys` keeps CLOCK_REALTIME aligned.
-- Bench: laptop Intel port (enp0s31f6, hardware timestamping) as grandmaster. Product: the controller's TSN switch (AC §8).
-- UTC comes from the grandmaster; NTP is only a bench convenience.
+- PHC (/dev/ptp0) is the reference; `ptp4l` (gPTP profile) on eth0, `phc2sys` keeps CLOCK_REALTIME aligned. Why PTP, alternatives and requirements at scale: DL-01.
+- Bench: laptop Intel port (enp0s31f6) as grandmaster, **disciplined by `phc2sys` to its NTP-synced system clock** (its hardware clock runs ~1600 ppm off on its own). Product: the controller's TSN switch (AC §8).
+- **Measured (P-3):** board as slave over the direct cable, **30 ns RMS / 85 ns max offset**, board crystal ~57 ppm, path delay +7.5 µs (stable). Absolute accuracy is not measured (gap G2, §11.6).
+- UTC comes from the grandmaster; NTP is only a bench convenience. Bench PTP time is UTC (`phc2sys -O 0`), not TAI as gPTP expects; to be fixed with the gPTP configuration (A11).
 
 ### 4.3 Session plan and index
 
@@ -145,6 +162,7 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 - **Match by time, not by queue position:** frame ↔ edge k if `t_frame − t_edge(k) ≈ expected latency (± tolerance)`. The latency (exposure + readout + capture, tens of ms) is measured at start; edges are 16.7-33.3 ms apart, so the match is unambiguous.
 - Clocks: edges are in PHC time, V4L2 frames in CLOCK_MONOTONIC. Converted via `phc2sys` / the PTP system-offset query (needs well under 1 ms).
 - **Edge without frame** = drop: gap recorded (manifest, health, event), index never reused. **Frame without edge** = spurious: flagged.
+- **Second check point, the encoder output:** every frame enters the encoder with a unique PTS (its trigger time); `nodecap` keeps a table PTS -> `{session, index}`. A PTS missing at the output = gap, a repeated PTS = duplicate. Needed because Wave5 was observed to lose and repeat a timestamp at stream start (P-1).
 - With a camera: the **sensor frame counter** must also advance by 1 per matched pair (third check).
 - Test source: frames are created from edges, so binding is by construction; drops and duplicates are **injected on purpose** to test detection.
 - SEI per frame (`user_data_unregistered`, our UUID): `{session, index, t_edge}`. A segment file copied anywhere still proves its own timing and gaps.
@@ -165,16 +183,12 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 - Each runs as a systemd service with restart. Health goes over a local socket to `nodeagent`.
 - `nodecap` and `recorder` share one process so encoded frames reach the recorder without inter-process transfer. The recorder stays a separate module (plain functions), ready to become the `segmentsink` element.
 
-**Language decision: C for all on-node code.**
-- **Chosen:** our code is on the data path; GStreamer's native API is C; the SDK cross-toolchain is ready; small footprint, which also fits the lite tier (RV1106: one A7 core, 128-256 MB RAM).
-- **Considered, Rust:** likely the right long-term choice (memory safety, official GStreamer plugin support via `gst-plugins-rs`), but its cross-toolchain setup is too long for the prototype. Noted as the product option.
-- **Rejected, Python** (on the node): slower, less control, much more CPU and memory than a firmware system should spend. Laptop test tools are not firmware; their language is separate.
-- **Libraries:** `libmicrohttpd` 12.62.1 is in the SDK sysroot and on the board image (dynamic link, nothing to copy). zcbor is vendored (§6).
+- **Language: C** for all on-node code (why: decision log DL-02). Libraries: `libmicrohttpd` 12.62.1 (in the SDK sysroot and on the board image); zcbor vendored (§6).
 
 ### 5.2 Sessions and segments
 
 - **Session:** assigned at arming (by the controller in the product, shared by all nodes). Index restarts at 0 per session. Statuses: `recording`, `complete`, `truncated`, `interrupted`.
-- **Segment length: 4 s.** Power of 2; whole frame counts (120 @30 fps, 240 @60 fps), so segment k starts at index k·120 (k·240); ~2.5 MB @1080p30, ~5 MB @1080p60. Within the AC §5 range of 1-10 s.
+- **Segment length: 4 s** (DL-07): segment k starts at index k·120 @30 fps (k·240 @60 fps); ~2.5 MB @1080p30, ~5 MB @1080p60.
 - A new session always starts a new segment; the last segment of a session may be short.
 - A pause between sessions is not a drop; gap detection runs within a session.
 
@@ -193,6 +207,8 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 - **Record per segment:** `{session, seg, first_idx, last_idx, t_first, t_last, bytes, keyframe byte offsets, flags (locked_until, gap, offloaded)}`, about 64 B. 24 h = 21,600 segments ≈ 1.4 MB.
 - **The manifest on eMMC is the truth:** every change (segment closed, reclaimed, locked) is appended immediately, then applied in RAM. **The RAM index is a mirror**, loaded once at boot. The manifest is compacted occasionally (new file + atomic rename).
 - **Queries never scan the eMMC:** sessions and segments come from RAM (binary search, ~15 steps for 24 h); fetch reads only the needed files.
+- **One owner:** `recorder` alone owns the index. `nodeagent` asks it over the local socket (session/index/time range -> files + keyframe byte offsets).
+- No database (SQLite considered and rejected: DL-06).
 
 ### 5.4 Ring and locks
 
@@ -265,11 +281,7 @@ Full spec: `docs/icd.md` (**TBD**), machine-checkable: CDDL schema per message +
 - **Events** (node -> controller): Server-Sent Events carrying CBOR (**TBD**).
 - **Product direction:** CoAP instead of HTTP for control and events, because the controller is a Zephyr MCU; same CBOR messages, only the transport changes. Fetch stays HTTP.
 
-**Encoding decision: CBOR + CDDL + zcbor.**
-- **Chosen:** an IETF standard; interoperable across the Linux node and the Zephyr MCU (controller, supervisor); native in Zephyr (MCUmgr, MCUboot use it); pairs with CoAP; debuggable as JSON; self-describing (readable without the schema).
-- **Considered, protobuf (nanopb):** equally industry-normal for small firmware, with generated code and clear field-number evolution. Not self-describing, and less aligned with the Zephyr/CoAP direction.
-- **Rejected:** JSON on the node (larger, slower parsing, a second code path to test); MessagePack (no standard schema, weak for conformance); FlatBuffers (overkill for kbps control traffic); raw C structs/TLV (unportable: endianness, padding, brittle versioning).
-- Neither CBOR nor protobuf libraries are in the TI SDK; either way the library is vendored, so the SDK did not decide it.
+Why CBOR/CDDL/zcbor and HTTP/CoAP, and what was rejected: DL-03, DL-04.
 
 | Group | Endpoints / content |
 |---|---|
@@ -331,12 +343,7 @@ Another node may use entirely different code for camera, ISP, encode and timing.
 
 - **Image:** Yocto scarthgap, TI config `processor-sdk-analytics-11.02.02` + our layer `meta-fwtrial` (services, configs, overlay, driver), pinned with kas.
 - **Now (bench):** cross-compile with the installed SDK (`linux-devkit/environment-setup-aarch64-oe-linux`) and copy to the board running the 11.0 image (user space compatible, §1.2).
-- **Build system: CMake.**
-  - One code base, two builds: the laptop (unit tests for recorder, matching, CBOR) and the board (cross-compiled). A small toolchain file `cmake/j722s-sdk.cmake` points at the SDK compiler and sysroot.
-  - `pkg_check_modules()` resolves GStreamer and libmicrohttpd against the SDK sysroot.
-  - `add_custom_command()` regenerates the zcbor C code when the `.cddl` changes.
-  - `ctest` for tests; `compile_commands.json` for tooling; the standard Yocto `cmake` class for the product image.
-  - Considered: plain Make (simpler and transparent, but two targets + pkg-config + code generation + tests get messy); Meson (GStreamer's own build system, attractive for our future elements, but not installed and CMake builds GStreamer plugins too).
+- **Build system: CMake** (DL-05): laptop build for unit tests, board cross-build via `cmake/j722s-sdk.cmake` (SDK compiler + sysroot); zcbor code regenerated from the `.cddl`; `ctest`; Yocto `cmake` class later.
 - **Kernel work** (overlay, driver) needs the matching kernel: install the SDK 6.12.57 kernel + modules + DTBs, or flash a fresh 11.02 image to a spare SD.
 - **Update/rollback:** A/B rootfs on eMMC (§5.7), boot counting in U-Boot (e.g. RAUC). **TBD**.
 - **Secure boot/identity:** board is HS-FS; product uses HS-SE with our keys; per-device key in OP-TEE / eMMC RPMB. **TBD**.
@@ -428,4 +435,11 @@ Full list with commands: `~/logs/0004-measurements-to-do.txt`.
 |---|---|---|---|---|
 | 1 **Changed** | Retrieval: "the controller is a client of N small file servers and forwards onward to a PC" (AC §5) | The PC fetches **directly from the nodes** through the switch. The controller orchestrates (sessions, locks, health) and never carries video bytes. | The PC needs a route to every node; access control moves to the nodes. | An nRF54 controller can't forward ~100 Mbps. Its load stays bounded by control traffic, which serves the AC's own goal of a small controller (§6, §7). |
 | 2 **Refined** | Each frame carries a trigger counter; "the trigger source logs the counter against UTC" (AC §4) | The index is **computed from the hardware edge timestamp**, `round((t_edge − T0)/period)`, against a shared session plan `{session, T0, period}`. Never counted. | Every node needs a PTP-locked clock with hardware edge timestamps (R3, R5). | A missed event can't shift later indices; a late or rebooted node rejoins on the grid; the same (session, index) on every node with no central counter log (§4.3). |
-| 3 **Kept, verified** | No supervisor MCU on the standard tier, because TI has 1588 built in (AC §3) | Kept. The J722S CPTS has 2 periodic outputs and 4 timestamp inputs, and the EVM already loops GENF1 into HW3_TS_PUSH: sufficient to generate and timestamp the trigger in hardware (§4.1). | Depends on routing a CPTS output to the camera pin (risk 2, §11.3). | No second codebase or MCU cost on the standard tier. |
+| 3 **Kept, verified** | No supervisor MCU on the standard tier, because TI has 1588 built in (AC §3) | Kept. The J722S CPTS has 2 periodic outputs and 4 timestamp inputs (checked on the board), and the timesync router can loop GENF1 into HW3_TS_PUSH: sufficient to generate and timestamp the trigger in hardware (§4.1; route needs an overlay, G1). | Depends on device-tree routing: the loop (G1) and a CPTS output to the camera pin (risk 2, §11.3). | No second codebase or MCU cost on the standard tier. |
+
+### 11.6 Known gaps
+
+| # | Gap | How we found it | Approach chosen | Until closed |
+|---|---|---|---|---|
+| G1 | **No GENF -> timestamp-input route on the current image.** The board's 11.0 device tree has no timesync router node and no `ti,pps`; the GENF1 -> HW3_TS_PUSH loop exists only in the 11.02 SDK EVM tree. Without it, `trigd` cannot timestamp its own edges. | Pre-coding check P-2: periodic output 1 ran, but no events arrived on any of the 4 timestamp inputs; the live device tree confirmed the missing router. | **Device-tree overlay** on the unmodified base tree, loaded by U-Boot (`name_overlays`): adds the timesync router (`reg-mux`) with `mux-reg-masks-state = <0x34 0x0001ffff 0x10011>` (output 12 = HW3_TS_PUSH <- input 17 = GENF1), without `ti,pps` so `trigd` owns GENF1. Board kernel supports it (`CONFIG_MUX_MMIO=y`, TI `mux-reg-masks-state` extension present). Source: `dts/k3-j722s-evm-fwtrial-cpts-loop.dtso`, not yet deployed. Rejected: booting a decompiled live tree (bakes in U-Boot fixups, replaces the reference tree), the 11.02 kernel (larger change), a physical wire (board modification). | `trigd` runs in **computed-time** mode (`t_k = T0 + k·period`). Edges are still generated in hardware on PTP time, but M4 (jitter) and per-edge proof that each edge fired need **measured** mode, i.e. the overlay. Downstream code is unaffected: it only sees `{session, index, t}`. |
+| G2 | **Absolute PTP accuracy not measured; bench grandmaster is a weak clock.** P-3 measured offset and stability (30 ns RMS), but PTP cannot see one-sided delays: part of the +7.5 µs path delay may be asymmetric latency inside the laptop's NIC, which would leave a constant offset of up to a few µs. The laptop's Intel I219 clock runs ~1600 ppm off and only works as grandmaster with `phc2sys`. P-3 used the default 1588 settings, not the gPTP profile. | P-3: the first run (without `phc2sys`) failed (board frequency pinned at the +488 ppm limit, negative path delay); comparing each clock to its own NTP-synced system clock identified the laptop. | Keep the laptop + `phc2sys` as bench grandmaster; report jitter and stability as **measured**, absolute alignment as **not measured**. Product: a real grandmaster, time-aware switches, gPTP profile, one-time calibration per hardware type against PPS + scope (DL-01). | No effect on a single node: its edges, timestamps and indices are consistent on its own clock. Matters only for cross-node alignment (described, not shown). |
