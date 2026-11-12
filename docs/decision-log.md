@@ -21,6 +21,7 @@ All dates 2026-11-12.
 | DL-11 | Trigger daemon -> consumers: Unix datagram socket, versioned C struct, subscription |
 | DL-12 | Session plan delivery and start time |
 | DL-13 | What to do when the clock is not verified as synchronised |
+| DL-14 | Trigger output left running after a crash of the trigger daemon |
 
 ---
 
@@ -217,3 +218,24 @@ The cost now is a few dozen lines.
 - configure `ptp4l` to **never jump the clock after the first lock**, only adjust its rate, which removes mid-session jumps at the source.
 
 Because the flag is in the message format from the start, these enhancements change only `trigd`, not its consumers.
+
+---
+
+## DL-14 Trigger output left running after a crash of the trigger daemon
+
+**Problem.** `trigd` starts the board's hardware trigger output (the PTP clock's periodic output) and stops it when it exits normally, when stopped with Ctrl-C or a termination signal, and on errors. If `trigd` **crashes** or is **killed outright** (`SIGKILL`), it never reaches that code, and the hardware **keeps firing trigger edges** until something stops it. The kernel does not stop the output when the program's file handle closes.
+
+**What we can and cannot check.**
+- Linux can start and stop a periodic output, but offers **no way to read whether one is running**. So "check the state at start" can only mean "assume it may be running and stop it".
+- `trigd` already does that: **at every start it stops the output unconditionally** before arming it again, and removes a stale socket file. The risk window is therefore from the crash until the next start.
+
+**Effect during that window.** A camera would keep exposing frames on edges nobody announces: the capture process sees **frames without a matching edge** and flags them as spurious (detected, not silently absorbed). Subscribers receive no "session ended" message, so they must notice that edges stopped arriving.
+
+**Decision now.** **No change for the first version.** We rely on the stop-at-start behaviour and keep it simple.
+
+**Preferred direction if time allows: systemd.** When `trigd` runs as a systemd service, a stop hook (`ExecStopPost=`) runs **after every exit, including crashes and `SIGKILL`**. It would call a small `trigd --disarm-only` mode (open the device, stop the output, exit). Together with automatic restart (`Restart=on-failure`), a crash is cleaned up and recovered within about a second, without extra logic inside `trigd`.
+
+**Other options considered, not planned now.**
+- **Crash marker file:** `trigd` writes a small state file when it arms the output and deletes it on a clean exit; finding the file at start means the previous run did not exit cleanly, so it can be logged and reported. Gives knowledge of the crash, not only cleanup.
+- **Silence detection in consumers:** no edge for a few periods means "trigger lost". Covers every cause (crash, hang, hardware); belongs in the capture process when it is written.
+- **Stopping the output from a crash signal handler** (segmentation fault, abort): possible but best effort only, and useless against `SIGKILL`.
