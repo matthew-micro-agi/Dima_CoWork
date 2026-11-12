@@ -1,0 +1,7 @@
+# Python tool environment (recreate from tools-requirements.txt)
+.venv/
+__pycache__/
+.pytest_cache/
+
+# CMake build directories (laptop and cross builds)
+build*/
