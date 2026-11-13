@@ -236,9 +236,43 @@ ssh root@10.42.0.132 \
 
 ---
 
-## 7. Device-tree overlay: CPTS timestamp loop (NOT YET)
+## 7. Device-tree overlay: CPTS timestamp loop (G1)
 
-Source: `dts/k3-j722s-evm-fwtrial-cpts-loop.dtso` (gap G1, decision log DL-09). Planned steps: compile with the SDK's `dtc`, copy to `/boot/dtb/ti/`, back up `uEnv.txt`, append to `name_overlays`, reboot, verify with `testptp` (timestamps on input 2 at the set rate). Undo: restore the `uEnv.txt` backup. To be written when deployed.
+Routes the CPTS periodic output 1 (the trigger edge) back into timestamp input 2, so `trigd` gets every edge's **hardware-captured** time (DL-09). Source `dts/k3-j722s-evm-fwtrial-cpts-loop.dtso`: the timesync router node of TI's 11.02 EVM tree, without `ti,pps` (so `trigd`, not the kernel's PPS, owns the output). Without it `trigd` still works, with computed edge times and a WARNING.
+
+Build (laptop) and install (board):
+```sh
+cd ~/Dima_CoWork && \
+~/ti/ti-processor-sdk-linux-adas-j722s-evm-11_02_02_05/linux-devkit/sysroots/x86_64-arago-linux/usr/bin/dtc \
+  -@ -I dts -O dtb -o /tmp/k3-j722s-evm-fwtrial-cpts-loop.dtbo \
+  dts/k3-j722s-evm-fwtrial-cpts-loop.dtso && \
+scp /tmp/k3-j722s-evm-fwtrial-cpts-loop.dtbo root@10.42.0.132:/boot/dtb/ti/
+```
+```sh
+ssh root@10.42.0.132 \
+  'cd /run/media/BOOT-mmcblk1p1 && cp uEnv.txt uEnv.txt.pre-g1 && \
+   sed -i "s|^name_overlays=ti/k3-j722s-edgeai-apps.dtbo$|& ti/k3-j722s-evm-fwtrial-cpts-loop.dtbo|" uEnv.txt && \
+   grep ^name_overlays uEnv.txt && sync && systemctl reboot'
+```
+Expected: `name_overlays=ti/k3-j722s-edgeai-apps.dtbo ti/k3-j722s-evm-fwtrial-cpts-loop.dtbo`; board back in ~25 s.
+
+**Verify:**
+```sh
+tools/fwt-doctor dev root@10.42.0.132      # OK  CPTS timestamp loop (G1 overlay)
+tests/trigd-check.sh dev root@10.42.0.132  # edges measured, interval = period, fallback
+```
+By hand, with `testptp` (`prereq/p2-cpts/build.sh`, copied to the board's `/tmp`): output 1 at 60 Hz, then 10 events on input 2, one every 16.666666 ms:
+```sh
+ssh root@10.42.0.132 \
+  '/tmp/testptp -d /dev/ptp0 -i 1 -p 16666666 >/dev/null; \
+   timeout 3 /tmp/testptp -d /dev/ptp0 -i 2 -e 10; \
+   /tmp/testptp -d /dev/ptp0 -i 1 -p 0 >/dev/null'
+```
+Live tree: `/sys/firmware/devicetree/base/bus@f0000/mux-controller@a40000` exists, `status` = `okay`, driver `mmio-mux`.
+
+**Undo:** `ssh root@10.42.0.132 'cd /run/media/BOOT-mmcblk1p1 && cp uEnv.txt.pre-g1 uEnv.txt && sync && systemctl reboot'`. If the board doesn't boot, edit `uEnv.txt` over the serial console (§2.1) or with the SD card in the laptop.
+
+**Limits:** proves the CPTS fired every edge on time inside the SoC; that the signal leaves the pin (J1 pin 18) needs the pin mux to the connector and a logic analyzer.
 
 ---
 

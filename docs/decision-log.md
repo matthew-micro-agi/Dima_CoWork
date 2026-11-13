@@ -107,10 +107,13 @@ All dates 2026-11-12.
 
 ## DL-09 Timestamping our own trigger edges: device-tree overlay
 
-- **Decision:** route the PTP periodic output 1 into timestamp input 3 through the SoC's timesync router, via a device-tree overlay on TI's unmodified tree (`dts/k3-j722s-evm-fwtrial-cpts-loop.dtso`). **Not deployed.** Until then edge times are computed, not measured (DL-13).
+- **Decision:** route the PTP periodic output 1 into timestamp input 3 (Linux index 2) through the SoC's timesync router, via a device-tree overlay on TI's unmodified tree (`dts/k3-j722s-evm-fwtrial-cpts-loop.dtso`). **Deployed 2026-11-13** (`setup.md` §7). `trigd --edges auto` (default) announces each edge with its captured time; no timestamp input, or no event for the first 3 edges -> WARNING, computed times for the session; an edge without its event is still announced with computed time and flag `TS_MISSING` (never lose a frame over a lost event); `--edges measured|computed` force a mode.
 - **Why:** on the bench the output ran but no timestamps arrived; the board's 11.0 device tree has no router configured (only the 11.02 SDK does); the board kernel supports the overlay.
 - **Alternatives, rejected:** boot an edited decompiled live tree (bakes in bootloader fixups, replaces TI's tree); 11.02 kernel + tree (much larger change, revisit for driver work); a wire between pins (board modification).
-- **Later:** deploy it and measure edge times; that proves each edge fired and gives jitter numbers.
+- **Measured (board):** 600 edges at 60 fps all captured, a constant +14 ns from T0 + k·P (routing); every interval = the period (0 ns at the 2 ns resolution); fallback and forced modes as designed (`trigd-check dev`).
+- **Seen:** the CPTS makes periods in whole 2 ns ticks; at 30 fps the period 33,333,333 ns ran 1 ns short per edge (30 ppb drift off the plan: 54 µs per 30 min; the index would slip after ~6 days). Periods are now whole ticks (30 fps = 33,333,334 ns, computed the same on every node); an odd `--period-ns` is rounded with a warning.
+- **Limits:** proves the edge fired inside the SoC, not at the pin (needs the pin mux to J1 pin 18 + logic analyzer).
+- **Later:** M4 over 30 min with PTP locked (edges must follow `ptp4l`'s corrections); edge to the connector pin.
 
 ## DL-10 Trial camera
 

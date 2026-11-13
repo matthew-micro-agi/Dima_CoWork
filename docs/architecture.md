@@ -144,9 +144,10 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 ### 4.1 Trigger generation in hardware [TI + EVM]
 
 - `trigd` (C) makes one request: a CPTS periodic output (GENF) starting at **T0**, period `1/fps` (standard Linux PTP `PTP_PEROUT_REQUEST`). **The CPTS fires every edge in hardware** on PTP time. Linux scheduling cannot delay or shift an edge.
-- Each edge is **timestamped in hardware** on a CPTS input (HW_TS_PUSH), routed from GENF1 to HW3_TS_PUSH through the timesync router. `trigd` reads them via `PTP_EXTTS_REQUEST`. A late read delays *when* we learn an edge, never *what time* it carries. On the current image this route is missing; see gap G1 (§11.6).
-- The CPTS runs at 500 MHz: 2 ns timestamp resolution. A periodic output keeps running after its file descriptor closes, so `trigd` disables it explicitly on stop.
-- When `ptp4l` adjusts the clock, the CPTS adjusts the edge frequency in hardware: edges stay locked to network time.
+- Each edge is **timestamped in hardware** on a CPTS input (HW_TS_PUSH), routed from GENF1 to HW3_TS_PUSH through the timesync router (our overlay, G1 closed, `setup.md` §7). `trigd` reads them from the kernel's event queue (`PTP_EXTTS_REQUEST`). A late read delays *when* we learn an edge, never *what time* it carries. `trigd --edges auto` (default) uses them when present, else computed times with a WARNING; an edge whose event is missing is still announced, flagged `TS_MISSING` (DL-09).
+  - **Measured (board, 60 and 30 fps):** every edge captured, a constant +14 ns from T0 + k·P (routing delay); every interval = the period (0 ns at the 2 ns resolution).
+- The CPTS runs at 500 MHz: 2 ns timestamp resolution, and it makes periods in **whole 2 ns ticks**. Periods are therefore chosen as whole ticks (30 fps = 33,333,334 ns): an odd period ran 1 ns short per edge and the edges drifted off the plan (30 ppb, seen on the board). A periodic output keeps running after its file descriptor closes, so `trigd` disables it explicitly on stop.
+- When `ptp4l` adjusts the clock, the CPTS adjusts the edge frequency in hardware: edges stay locked to network time. *(To verify with measured edges while PTP is locked: M4 under PTP.)*
 - **Route to the sensor:** GENF -> pin mux (our overlay) -> SoC pad GPMC0_AD7 -> J1 pin 18 -> module -> sensor trigger input.
   - **Open:** can GENF (or a timer output) be muxed onto GPMC0_AD7? *(verify in the J722S pin mux table.)* If yes, it's an overlay only. If only a DMTimer output is available, discipline it from PTP via the timesync router. If neither, a jumper wire from a GENF-capable pad (ask Matthew).
   - The I/O level (SW2.4) must match the module.
@@ -189,7 +190,7 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 | Process | Language | Role |
 |---|---|---|
-| `trigd` | C | arms CPTS GENF at T0, reads HW_TS_PUSH events, computes indices, publishes `{index, t_edge}`. **v1 done:** computed edge times until G1 is closed |
+| `trigd` | C | arms CPTS GENF at T0, reads HW_TS_PUSH events, computes indices, publishes `{index, t_edge}`. **done:** measured edge times from the CPTS loop (G1), computed fallback |
 | `nodecap` + `recorder` | C, **one process** | GStreamer pipeline (elements [TI]); matching, drop detection, SEI insertion; segments, manifest, ring, locks (separate module) |
 | `nodeagent` | C | control interface (§6) on `libmicrohttpd`, segment fetch. **v1 done:** the only long-running process; starts `trigd` + `nodecap` per session (DL-23) |
 | `ptp4l`, `phc2sys` | linuxptp | time |
@@ -392,7 +393,7 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 |---|---|---|
 | M1/M2 | eMMC read speed, identity, wear | nothing (read-only) |
 | M3 | eMMC write speed (need 0.6-1.2 MB/s) | `/rec` partition |
-| M4 | Trigger interval jitter (CPTS timestamps; later a logic analyzer on J1 pin 18) | `trigd` |
+| M4 | Trigger interval jitter (CPTS timestamps; later a logic analyzer on J1 pin 18) | `trigd` measured; first numbers: interval = period within 2 ns (300-600 edges); 30-min run with PTP locked todo |
 | M5 | PTP offset to the laptop | `ptp4l` |
 | M6 | Encoder bitrate and CPU @30/@60 | encode pipeline |
 | M7 | Frames vs drops, 30+ min, with injected drops | test source + matching |
@@ -424,7 +425,7 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 | # | Component | Camera needed? | Status (2026-11-13) |
 |---|---|---|---|
 | A1 | Encode pipeline (test video -> Wave5) | no | **done** (`nodecap`, board) |
-| A2 | `trigd`: CPTS edges + hardware timestamps | no | **v1 done:** hardware edges, computed times (G1) |
+| A2 | `trigd`: CPTS edges + hardware timestamps | no | **done:** hardware edges, hardware-measured times (overlay, G1 closed); computed fallback |
 | A3 | Trigger-driven test source | no | **done** (drawn index) |
 | A4 | SEI per frame | no | **done** (+ `sei-dump`) |
 | A5 | Recorder: segments, manifest, ring, locks | no | **done** (`src/recorder`, `rec-tool`, `recorder-check.sh`) |
@@ -474,6 +475,6 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 
 | # | Gap | How we found it | Approach chosen | Until closed |
 |---|---|---|---|---|
-| G1 | **No GENF -> timestamp-input route on the current image.** The board's 11.0 device tree has no timesync router node and no `ti,pps`; the GENF1 -> HW3_TS_PUSH loop exists only in the 11.02 SDK EVM tree. Without it, `trigd` cannot timestamp its own edges. | Pre-coding check P-2: periodic output 1 ran, but no events arrived on any of the 4 timestamp inputs; the live device tree confirmed the missing router. | **Device-tree overlay** on the unmodified base tree, loaded by U-Boot (`name_overlays`): adds the timesync router (`reg-mux`) with `mux-reg-masks-state = <0x34 0x0001ffff 0x10011>` (output 12 = HW3_TS_PUSH <- input 17 = GENF1), without `ti,pps` so `trigd` owns GENF1. Board kernel supports it (`CONFIG_MUX_MMIO=y`, TI `mux-reg-masks-state` extension present). Source: `dts/k3-j722s-evm-fwtrial-cpts-loop.dtso`, not yet deployed. Rejected: booting a decompiled live tree (bakes in U-Boot fixups, replaces the reference tree), the 11.02 kernel (larger change), a physical wire (board modification). | `trigd` runs in **computed-time** mode (`t_k = T0 + k·period`). Edges are still generated in hardware on PTP time, but M4 (jitter) and per-edge proof that each edge fired need **measured** mode, i.e. the overlay. Downstream code is unaffected: it only sees `{session, index, t}`. |
+| G1 | **Closed 2026-11-13.** **No GENF -> timestamp-input route on the current image.** The board's 11.0 device tree has no timesync router node and no `ti,pps`; the GENF1 -> HW3_TS_PUSH loop exists only in the 11.02 SDK EVM tree. Without it, `trigd` cannot timestamp its own edges. | Pre-coding check P-2: periodic output 1 ran, but no events arrived on any of the 4 timestamp inputs; the live device tree confirmed the missing router. | **Device-tree overlay** on the unmodified base tree, loaded by U-Boot (`name_overlays`): adds the timesync router (`reg-mux`) with `mux-reg-masks-state = <0x34 0x0001ffff 0x10011>` (output 12 = HW3_TS_PUSH <- input 17 = GENF1), without `ti,pps` so `trigd` owns GENF1. Board kernel supports it (`CONFIG_MUX_MMIO=y`, TI `mux-reg-masks-state` extension present). Source: `dts/k3-j722s-evm-fwtrial-cpts-loop.dtso`, not yet deployed. Rejected: booting a decompiled live tree (bakes in U-Boot fixups, replaces the reference tree), the 11.02 kernel (larger change), a physical wire (board modification). | `trigd` runs in **computed-time** mode (`t_k = T0 + k·period`). Edges are still generated in hardware on PTP time, but M4 (jitter) and per-edge proof that each edge fired need **measured** mode, i.e. the overlay. Downstream code is unaffected: it only sees `{session, index, t}`. |
 | G2 | **Absolute PTP accuracy not measured; bench grandmaster is a weak clock.** P-3 measured offset and stability (30 ns RMS), but PTP cannot see one-sided delays: part of the +7.5 µs path delay may be asymmetric latency inside the laptop's NIC, which would leave a constant offset of up to a few µs. The laptop's Intel I219 clock runs ~1600 ppm off and only works as grandmaster with `phc2sys`. P-3 used the default 1588 settings, not the gPTP profile. | P-3: the first run (without `phc2sys`) failed (board frequency pinned at the +488 ppm limit, negative path delay); comparing each clock to its own NTP-synced system clock identified the laptop. | Keep the laptop + `phc2sys` as bench grandmaster; report jitter and stability as **measured**, absolute alignment as **not measured**. Product: a real grandmaster, time-aware switches, gPTP profile, one-time calibration per hardware type against PPS + scope (DL-01). | No effect on a single node: its edges, timestamps and indices are consistent on its own clock. Matters only for cross-node alignment (described, not shown). |
 | G3 | **Camera not detected.** The bench AR0234 module answers on no EVM camera connector; the image has no AR0234 driver or overlay (only IMX219, OV5640). | Board side checked: connector mux, enable pins (GPIO mode, driven high), I/O level 3.3 V (SW2.4), trace mode off, pinout = Raspberry Pi 22-pin; I2C scan of all four connector buses finds nothing. | Remaining causes are physical: cable type, module pinout, power at the module. Next: multimeter at the module, other cable type, module documentation, or a known-good Raspberry Pi camera (IMX219) to prove the board path. | Slice runs on the trigger-driven test source (DL-10). Even once detected: driver port + overlay, build against the board kernel (6.12.17) or move to 11.02, ISP tuning (colour). |
