@@ -34,6 +34,7 @@ add_subdirectory(src/tools/fwt-info)
 add_subdirectory(src/tools/trig-listen)
 add_subdirectory(src/tools/rec-tool)
 add_subdirectory(src/tools/cam-emu)    # test only, not installed (DL-26)
+add_subdirectory(src/tools/fwt-rec)    # laptop/Linux client, not installed
 if(NOT CMAKE_CROSSCOMPILING)
   add_subdirectory(src/tools/sei-dump)   # laptop only (uses ffmpeg)
 endif()

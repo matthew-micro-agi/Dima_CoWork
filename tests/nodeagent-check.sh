@@ -134,6 +134,29 @@ scenario() {
 	expect disarm-idle 409 '"code": "not-armed"'
 }
 
+# fwt-rec (laptop client, C): one recording through the whole interface
+# (identity, health, arm, wait on the node clock, disarm, sessions, segments,
+# fetch in 2 s parts), file checked with sei-dump, sidecar JSON parsed.
+fwt_rec_run() {
+	local F="$ROOT/build-host/src/tools/fwt-rec/fwt-rec" out="$LOG/fwt-rec.h265" rc
+	echo "== fwt-rec: 5 s recording, fetched in 2 s parts"
+	"$F" 127.0.0.1:18080 --duration 5 --fetch-s 2 --out "$out" -q >"$LOG/fwt-rec.log" 2>&1
+	rc=$?
+	expect_rc "fwt-rec" $rc 0
+	grep -q "check: passed" "$LOG/fwt-rec.log" && grep -q "pixels ok" "$LOG/fwt-rec.log" &&
+		pass "fwt-rec: file checked by sei-dump (pixels ok)" ||
+		fail "fwt-rec: check (see $LOG/fwt-rec.log)"
+	"$ROOT/.venv/bin/python" -I -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["recorded"]["status"] == "complete" and d["recorded"]["missing"] == 0
+assert d["file"]["fetches"] >= 2 and d["file"]["frames"] == d["recorded"]["frames"]
+assert d["check"]["result"] == "passed" and not d["plan"]["interrupted"]
+' "$out.json" 2>"$LOG/fwt-rec-json.log" &&
+		pass "fwt-rec: sidecar JSON valid, complete, $(grep -o '"fetches": [0-9]*' "$out.json")" ||
+		fail "fwt-rec: sidecar JSON (see $LOG/fwt-rec-json.log)"
+}
+
 run_host() {
 	local B="$ROOT/build-host/src" AP
 	URL=http://127.0.0.1:18080
@@ -146,6 +169,7 @@ run_host() {
 	AP=$!
 	sleep 0.5
 	scenario
+	fwt_rec_run
 	kill -INT $AP
 	wait $AP && pass "nodeagent stopped cleanly" || fail "nodeagent exit (see $LOG/nodeagent.log)"
 }
