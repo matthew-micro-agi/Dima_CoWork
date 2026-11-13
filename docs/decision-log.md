@@ -29,6 +29,8 @@ All dates 2026-11-12.
 | DL-19 | Manifest: fixed 128-byte records with checksum |
 | DL-20 | Session number: made by the single plan maker, never by a node |
 | DL-21 | Recorder v1: full scope |
+| DL-22 | Control interface reads the recordings index read-only |
+| DL-23 | Session start: nodeagent starts trigd + nodecap per session |
 
 ---
 
@@ -181,4 +183,18 @@ All dates 2026-11-12.
 
 - **Decision:** v1 = segments, manifest, ring, locks (incl. post-event window and lock cap), recovery after crash or power loss, `rec-tool` (list, verify, lock). Fetch over the network comes with the control interface (`nodeagent`).
 - **Why:** the brief's storage questions (ring, locks, crash behaviour) are answered only by the full set; fetch needs the control interface anyway.
+
+## DL-22 Control interface reads the recordings index read-only
+
+- **Decision:** `nodeagent` reads `/rec/manifest.bin` read-only for queries and fetch; lock/unlock go to the running recorder over its control socket, or directly when no session runs. Queries and fetch answer **immediately with the last known good state** (all closed segments); a running session's open segment (at most the last 4 s) is not included yet, and the response says so.
+- **Why:** the recorder lives inside `nodecap`, which runs only during a session; the manifest is append-only with a CRC per record, so a concurrent reader sees a complete state (a half-written last record is skipped). No query protocol needed now.
+- **Safety:** GET never changes state; inputs validated (strict numbers, CBOR decoded by generated code, body limit); limits on simultaneous fetches, fetch length and connection time; a segment opened for fetch stays readable if the ring deletes it meanwhile.
+- **Alternative:** queries over the recorder's socket (strict single owner, includes the open segment) needs a recorder running as its own daemon: bigger restructure.
+- **Later:** open segment up to its last flushed keyframe via recorder queries.
+
+## DL-23 Session start: nodeagent starts trigd + nodecap per session
+
+- **Decision:** `nodeagent` is the only long-running process. `POST /v1/arm {session, t0?, fps}` starts `trigd` and `nodecap --rec /rec` as child processes for that session; disarm stops them cleanly; one session at a time; a child that dies stops the session and shows in health.
+- **Why:** smallest working path for the trial; the HTTP interface is the same as the product's.
+- **Alternative (product):** `trigd` and `nodecap` run permanently and receive session plans over local sockets (DL-12), supervised by systemd (DL-14).
 
