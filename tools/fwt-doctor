@@ -205,6 +205,11 @@ if [ -c /dev/ptp0 ]; then
 else
 	r FAIL "/dev/ptp0 missing (trigger needs the CPTS)" "check the image / device tree   (docs/setup.md 4)"
 fi
+if [ -e /sys/firmware/devicetree/base/bus@f0000/mux-controller@a40000 ]; then
+	r OK "CPTS timestamp loop (G1 overlay): trigger edge times measured in hardware"
+else
+	r WARN "no CPTS timestamp loop (G1 overlay): trigger edge times computed, not measured" "docs/setup.md 7"
+fi
 enc=""
 for d in /sys/class/video4linux/video*; do
 	case "$(cat $d/name 2>/dev/null)" in *Wave5*encoder*) enc="/dev/${d##*/} ($(cat $d/name))" ;; esac

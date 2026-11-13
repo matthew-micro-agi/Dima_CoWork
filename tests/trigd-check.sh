@@ -76,6 +76,45 @@ run_dev() {
 		pass "board: ran on /dev/ptp0, output disarmed at the end" ||
 		fail "board: clock/disarm (see $LOG/d1.log)"
 
+	# Hardware edge timestamps (G1, DL-09): with the CPTS loop overlay, every edge
+	# must carry its captured time, close to the plan (constant routing delay).
+	local loop m
+	loop=$(ssh -o BatchMode=yes "$NODE" \
+		'test -e /sys/firmware/devicetree/base/bus@f0000/mux-controller@a40000 && echo yes || echo no')
+	if [ "$loop" = yes ]; then
+		m=$(sed -n 's/.*published \([0-9]*\) = measured \([0-9]*\) + without hardware timestamp \([0-9]*\) .*max \([0-9]*\) ns.*/\1 \2 \3 \4/p' "$LOG/d1.log")
+		set -- $m
+		if [ "${1:-}" = 300 ] && [ "${2:-}" = 300 ] && [ "${3:-}" = 0 ] && [ "${4:-999999}" -lt 1000 ]; then
+			pass "board: 300 edges measured in hardware, 0 without timestamp, max $4 ns off the plan"
+		else
+			fail "board: measured edges (published/measured/missing/max ns: ${m:-?}; see $LOG/d1.log)"
+		fi
+		grep -q "flags seen 0x1 " "$LOG/d1.log" && pass "board: edges flagged measured (no COMPUTED)" ||
+			fail "board: edge flags (see $LOG/d1.log)"
+		# M4: hardware edges every exactly one period (CPTS resolution 2 ns); an
+		# odd period once ran 1 ns short per edge, drifting off the plan
+		local iv
+		iv=$(sed -n 's/.*interval - period: min \(-*[0-9]*\) ns, max \(-*[0-9]*\) ns.*/\1 \2/p' "$LOG/d1.log")
+		set -- $iv
+		if [ -n "${1:-}" ] && [ "${1#-}" -le 2 ] && [ "${2#-}" -le 2 ]; then
+			pass "board: every interval = period within 2 ns (min $1, max $2 ns): no drift off the plan"
+		else
+			fail "board: interval - period min/max ${iv:-?} ns (see $LOG/d1.log)"
+		fi
+	else
+		echo "SKIP  board: no CPTS loop overlay (G1): edge times computed, not measured (docs/setup.md 7)"
+	fi
+
+	echo "== board: timestamp input without the loop (--extts 3): fallback to computed"
+	ssh -o BatchMode=yes "$NODE" \
+		'/tmp/trigd --session '"$(new_session)"' --count 120 --extts 3 2>/tmp/trigd-check-4.log & sleep 0.5; \
+		 /tmp/trig-listen -q 2>&1; wait; cat /tmp/trigd-check-4.log' >"$LOG/d4.log" 2>&1
+	check_listen "board fallback" "$LOG/d4.log" 120 0
+	grep -q "WARNING: no hardware timestamp event" "$LOG/d4.log" &&
+		grep -q "edges computed (fallback)" "$LOG/d4.log" &&
+		pass "board fallback: warning, computed edge times, no edge lost" ||
+		fail "board fallback: no warning/fallback (see $LOG/d4.log)"
+
 	echo "== board: stop with SIGINT mid-session"
 	ssh -o BatchMode=yes "$NODE" \
 		'/tmp/trigd --session '"$(new_session)"' 2>/tmp/trigd-check-2.log & TP=$!; sleep 0.5; \
