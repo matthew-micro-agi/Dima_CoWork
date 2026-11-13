@@ -21,9 +21,11 @@ configure_file(src/common/fwt_version.h.in
 
 add_subdirectory(src/common)
 add_subdirectory(src/trigd)
+add_subdirectory(src/recorder)
 add_subdirectory(src/nodecap)
 add_subdirectory(src/tools/fwt-info)
 add_subdirectory(src/tools/trig-listen)
+add_subdirectory(src/tools/rec-tool)
 if(NOT CMAKE_CROSSCOMPILING)
   add_subdirectory(src/tools/sei-dump)   # laptop only (uses ffmpeg)
 endif()

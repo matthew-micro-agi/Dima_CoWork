@@ -17,3 +17,7 @@ add_test(NAME stamp COMMAND test_stamp)
 add_executable(test_nodecap test_nodecap.c)
 target_link_libraries(test_nodecap PRIVATE nodecap_core fwt_common)
 add_test(NAME nodecap COMMAND test_nodecap)
+
+add_executable(test_recorder test_recorder.c)
+target_link_libraries(test_recorder PRIVATE recorder fwt_common)
+add_test(NAME recorder COMMAND test_recorder)
