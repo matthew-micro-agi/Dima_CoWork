@@ -544,9 +544,30 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 - **Order:** A2 -> A1 + A3 + A4 -> A5 + A6 -> A7, A8 -> A10 -> A9 / A11.
 - **Critical path for real video:** camera connected -> driver + overlay -> ISP -> binding. B replaces A3; everything else stays.
 
-### 11.2 Milestones
+### 11.2 Next steps, in order (draft, no time frames yet)
 
-**TBD:** 4 weeks / 3 months / 6 months.
+Each step unblocks the next. The emulator, stress tests and the CI rig grow alongside, as the tests each step needs.
+
+1. **Real camera chain** (blocked today by G3):
+   - trigger to the connector: pin mux GENF -> J1 pin 18 (§4.1 "Open"); logic analyzer at the pin (M4 at the pin);
+   - sensor driver + device-tree overlay, ISP path (VPAC via TIOVX), `nodecap` V4L2 source;
+   - binding calibrated on the camera: latency spread under load with fixed exposure -> window and latency (DL-27); latency tracking with auto-exposure; sensor frame counter as the third check.
+2. **Robustness on one node:**
+   - recovery tests (M10): power pull, Ethernet unplug, `kill -9` while recording;
+   - PTP lock check and `time_verified` (DL-13), gPTP profile, PTP state in health;
+   - health and events complete (PTP, eMMC wear alarms, temperature; events over SSE);
+   - long runs: days instead of 30 min (eMMC wear per day, ring, thermal, long sessions); faults during fetch and lock, full disk.
+3. **Several nodes:** second board, PTP-aware switch, controller fan-out (one plan, one T0 to all; built from `fwt-rec`'s `ctl_node`, DL-28); measure edge skew per index across nodes and absolute accuracy (G2: PPS + scope); conformance suite / node simulator (A9, §8).
+4. **More sensors per node:**
+   - two cameras: both on the same edge (one pin or two CPTS outputs); **encoder budget:** Wave5 measured ~100 fps at 1920x1200 (P-1), so 2 x 60 fps does not fit (2 x 30 fps, lower resolution, or a split to verify);
+   - camera + IMU: IMU samples timed on the same PTP clock (data-ready interrupt into a free CPTS timestamp input, or via the supervisor MCU); IMU data recorded next to the segments, indexed by time;
+   - two cameras + IMU.
+5. **Product platform:** Yocto layer `meta-fwtrial`, A/B rootfs with boot counting (e.g. RAUC), signed bundles, secure boot (HS-SE) and device identity (§9); control-interface security (auth, closed network, DL-01 security).
+6. **Lite tier:** RV1106 + supervisor MCU as an edge source; time base chosen by the sync budget (§11.4, DL-01 "Lite tier"); check RV1106 hardware PTP timestamps first.
+
+**Alongside:**
+- **Emulator** (`cam-emu`), to test each step before its hardware: exposure-dependent latency, interrupt-like jitter under load, a sensor frame counter; later two cameras and an IMU.
+- **CI / hardware-in-the-loop rig** (§10.3): nightly check scripts on a board; later several nodes with a logic analyzer / time-to-digital converter on trigger and strobe lines.
 
 ### 11.3 Top 5 risks
 
