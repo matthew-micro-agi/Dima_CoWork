@@ -25,6 +25,7 @@ struct ctl_health {
 	char     state[16];      /* "idle" | "recording" | "failed" */
 	uint32_t session;
 	uint64_t ring_used, ring_locked, ring_free, depth_s;
+	uint64_t emmc_life_a, emmc_life_b, emmc_pre_eol;  /* EXT_CSD, 0 = unknown */
 	uint64_t frames, missing;
 	int64_t  temp_mc;
 	int64_t  phc_ns;         /* node's PTP clock now */

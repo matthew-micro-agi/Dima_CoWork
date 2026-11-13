@@ -2,6 +2,7 @@
  * fwt-rec: one recording on one node, from a laptop or any Linux box.
  *
  *   fwt-rec 10.42.0.132 --duration 30 --out run1.h265 [--fps 60] [--session N]
+ *   fwt-rec 10.42.0.132 --info      node identity and health, read-only
  *
  * identity -> health (must not be recording) -> arm (new session) -> wait on
  * the node's own clock until T0 + duration, with progress -> disarm (always,
@@ -48,6 +49,7 @@ static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"usage: %s <node>[:port] --duration S --out FILE [options]\n"
+		"       %s <node>[:port] --info   identity + health, read-only\n"
 		"  <node>[:port]    node address, port default 8080\n"
 		"  --duration S     seconds to record (from the first trigger edge)\n"
 		"  --out FILE       H.265 file written on this machine; FILE.json next to it\n"
@@ -55,7 +57,7 @@ static void usage(const char *prog)
 		"  --session N      session number (default: a new random one, DL-20)\n"
 		"  --fetch-s N      longest part per fetch, seconds (default and max 600)\n"
 		"  -q               quiet: no progress lines\n",
-		prog);
+		prog, prog);
 }
 
 static void sleep_ms(long ms)
@@ -243,6 +245,28 @@ static void check_file(struct rec_result *r)
 	r->check = (st == 0) ? "passed" : "failed";
 }
 
+/* --info: one line per item, "key: value" (deploy.sh reads "version:"). */
+static int print_info(struct ctl_http *h, struct ctl_buf *b, const struct ctl_identity *id)
+{
+	struct ctl_health hl;
+
+	printf("version: %s\n", id->version);
+	if (get_health(h, b, &hl))
+		return 1;
+	printf("state: %s%s%s\n", hl.state, hl.message[0] ? ": " : "", hl.message);
+	printf("session: %" PRIu32 " (%s), frames %" PRIu64 ", missing %" PRIu64 "\n", hl.session,
+	       strcmp(hl.state, "recording") ? "last" : "current", hl.frames, hl.missing);
+	printf("ring: used %.1f MB, locked %.1f MB, free %.1f MB, depth %" PRIu64 " s\n",
+	       hl.ring_used / 1e6, hl.ring_locked / 1e6, hl.ring_free / 1e6, hl.depth_s);
+	printf("emmc: life A %" PRIu64 ", life B %" PRIu64 ", pre-EOL %" PRIu64
+	       " (1 = 0-10 %% used / normal, 0 = unknown)\n", hl.emmc_life_a, hl.emmc_life_b,
+	       hl.emmc_pre_eol);
+	printf("temperature: %.1f C\n", hl.temp_mc / 1000.0);
+	printf("ptp clock: %" PRId64 " ns, time %s\n", hl.phc_ns,
+	       hl.time_verified ? "verified" : "not verified");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	static const struct option lo[] = {
@@ -251,13 +275,14 @@ int main(int argc, char **argv)
 		{ "fps", required_argument, NULL, 'f' },
 		{ "session", required_argument, NULL, 's' },
 		{ "fetch-s", required_argument, NULL, 'F' },
+		{ "info", no_argument, NULL, 'I' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	double duration = 0;
 	const char *out_path = NULL;
 	unsigned long fps = 30, session = 0, fetch_s = MAX_FETCH_S;
-	bool quiet = false;
+	bool quiet = false, info = false;
 	int c;
 
 	while ((c = getopt_long(argc, argv, "qh", lo, NULL)) != -1) {
@@ -268,10 +293,11 @@ int main(int argc, char **argv)
 		case 's': session = strtoul(optarg, NULL, 0); break;
 		case 'F': fetch_s = strtoul(optarg, NULL, 0); break;
 		case 'q': quiet = true; break;
+		case 'I': info = true; break;
 		default: usage(argv[0]); return 2;
 		}
 	}
-	if (optind != argc - 1 || duration <= 0 || !out_path || fps == 0 ||
+	if (optind != argc - 1 || (!info && (duration <= 0 || !out_path)) || fps == 0 ||
 	    session > UINT32_MAX || fetch_s == 0 || fetch_s > MAX_FETCH_S) {
 		usage(argv[0]);
 		return 2;
@@ -303,6 +329,8 @@ int main(int argc, char **argv)
 	}
 	printf("node %s (%s), %ux%u, fps %u-%u\n", r.id.node, r.id.version, r.id.width,
 	       r.id.height, r.id.fps_min, r.id.fps_max);
+	if (info)
+		return print_info(&h, &b, &r.id);
 	if (fps < r.id.fps_min || fps > r.id.fps_max) {
 		fprintf(stderr, "fwt-rec: --fps %lu outside the node's range %u-%u\n", fps,
 			r.id.fps_min, r.id.fps_max);

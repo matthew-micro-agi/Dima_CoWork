@@ -49,6 +49,9 @@ int ctl_dec_health(const uint8_t *b, size_t n, struct ctl_health *out)
 	out->ring_locked = d.health_ring_locked;
 	out->ring_free = d.health_ring_free;
 	out->depth_s = d.health_depth_s;
+	out->emmc_life_a = d.health_emmc_life_a;
+	out->emmc_life_b = d.health_emmc_life_b;
+	out->emmc_pre_eol = d.health_emmc_pre_eol;
 	out->frames = d.health_frames;
 	out->missing = d.health_missing;
 	out->temp_mc = d.health_temp_mc;

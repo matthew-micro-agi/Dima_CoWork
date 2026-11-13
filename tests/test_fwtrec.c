@@ -66,6 +66,7 @@ static void test_health_arm_error(void)
 	CHECK(!strcmp(h.state, "recording") && h.session == 77 && h.frames == 900 &&
 	      h.missing == 2 && h.temp_mc == -1500 && h.phc_ns == 1794578203500000000LL &&
 	      !h.time_verified && h.ring_free == 5000 && h.message[0] == '\0');
+	CHECK(h.emmc_life_a == 1 && h.emmc_life_b == 1 && h.emmc_pre_eol == 1 && h.depth_s == 3600);
 
 	CHECK(ctl_dec_arm_rep(arm_rep_ok, sizeof(arm_rep_ok), &a) == 0);
 	CHECK(a.session == 77 && a.t0 == 1794578204000000000LL && a.period == 33333333);
