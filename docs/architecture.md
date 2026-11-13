@@ -334,6 +334,7 @@ A software **node simulator** serves the same interface, so the conformance suit
 ## 7. Controller and supervisor (design only, not on the bench)
 
 - **Controller (B3, nRF54L15 + LAN9668, Zephyr):** fleet registry, session plans `{session, T0, period}`, gPTP time master via the LAN9668, command fan-out, health aggregation. Never in the video path.
+- **Start of its code (bench):** `fwt-rec` (DL-28), one node, one recording: `ctl_node` (ICD protocol via zcbor, no I/O) is meant to carry over; `ctl_http` (libcurl) is replaced by the controller's transport.
 - **Supervisor MCU (lite nodes, nRF54L15, Zephyr):** FSIN generate/receive + timestamp, trigger index to the SoC, IMU over SPI, power sequencing, watchdog, rollback, identity. On our J722S node the CPTS does the trigger job, so no MCU (see §11.4).
 
 ---

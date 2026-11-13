@@ -35,6 +35,7 @@ All dates 2026-11-12.
 | DL-25 | PTP on the node as a systemd service |
 | DL-26 | Camera emulator: separate test process with a V4L2-like buffer protocol |
 | DL-27 | Frame-to-edge binding by time, shared by all camera sources |
+| DL-28 | Laptop recording client in C (`fwt-rec`), start of the controller code |
 
 ---
 
@@ -237,3 +238,15 @@ All dates 2026-11-12.
   - Before a real camera is trusted: the sensor's own frame counter (AR0234 embedded data lines) as a second, independent signal, so each frame carries which trigger made it; timing becomes the cross-check.
   - Real camera bring-up: measure the timestamp spread (fixed exposure, under load), then set the window.
   - Latency measured and tracked automatically (it moves with exposure time if the timestamp marks the end of the frame).
+
+## DL-28 Laptop recording client in C (`fwt-rec`), start of the controller code
+
+- **Decision:** `fwt-rec <node> --duration S --out FILE [--fps N]` records one session from the laptop: health -> arm -> wait on the node's PTP clock (`/health` `phc_ns`) until T0 + duration -> disarm (always, also on Ctrl-C) -> fetch the whole session in segment-aligned parts (<= 600 s, the node's limit) -> `FILE.json` sidecar -> `sei-dump` check. C, built for the laptop and the board; not in the node bundle.
+- **Structure:** `ctl_node` = the protocol (requests encoded, replies decoded with the zcbor code generated from the ICD; no I/O); `ctl_http` = the only HTTP part (libcurl); `main` = the flow.
+- **Why C:** the start of the controller (C on Zephyr, zcbor, architecture §7): `ctl_node` carries over as is, only the transport changes (CoAP or Zephyr's HTTP client, DL-04). Runs on any Linux box without Python. The client side of the ICD in C next to the server: tested against messages written by cbor2, an independent implementation.
+- **Why libcurl:** on practically every embedded Linux image (on this board's image and in the SDK sysroot); chunked transfer, timeouts and long streamed downloads handled correctly. Laptop: `libcurl4-openssl-dev`.
+- **Why wait on the node's clock:** the duration is exact without knowing the laptop/node clock offset.
+- **Why the sidecar:** a `.h265` carries session and index per frame (SEI), not which node and software recorded it, nor when or what was missing.
+- **Alternatives:** Python with cbor2 (a third of the code, laptop only, nothing for the controller); `curl` + `tools/icd-json` by hand (kept for single requests); hand-written HTTP client (no dependency, but chunking, timeouts and errors to get right).
+- **Seen:** zcbor writes a map with optional keys (`arm-req`) as indefinite length (`bf ... ff`), cbor2 as definite: both valid CBOR, both decoded by either side.
+- **Later:** several nodes with one explicit T0 (the controller's fan-out); `--lock` and `--last N`; live frame count in `/health` (now per closed segment).

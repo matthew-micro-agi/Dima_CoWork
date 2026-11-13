@@ -70,12 +70,12 @@ sudo apt install -y \
   linuxptp python3-venv cmake pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libgstreamer-plugins-bad1.0-dev libmicrohttpd-dev \
-  gstreamer1.0-plugins-bad \
+  libcurl4-openssl-dev gstreamer1.0-plugins-bad \
   ffmpeg gdb-multiarch valgrind cppcheck clang-format
 ```
 The dev packages are only for building and testing on the laptop; board binaries are always built against the SDK sysroot. The laptop has GStreamer 1.24, the board 1.22: avoid APIs newer than 1.22.
 
-**Verify:** `command -v ptp4l phc2sys cmake ffprobe` and `gst-inspect-1.0 x265enc`, `gst-inspect-1.0 h265parse` (laptop encoder for `nodecap-check.sh host`).
+**Verify:** `command -v ptp4l phc2sys cmake ffprobe` and `gst-inspect-1.0 x265enc`, `gst-inspect-1.0 h265parse` (laptop encoder for `nodecap-check.sh host`); `pkg-config --modversion libcurl` (for `fwt-rec`, §8.4; without it the build skips `fwt-rec`).
 
 ### 2.4 Python tools (venv)
 
@@ -252,7 +252,7 @@ cmake --build build-board -j
 | | `dev <user@node>` | laptop + board builds; 300 edges on `/dev/ptp0` with Wave5 on the board; stream copied back, `sei-dump` here |
 | `tests/recorder-check.sh` | `host` | build, unit tests; `nodecap --rec` (x265) in temp dirs: record 300 + live lock + `rec-tool verify`; same session refused; `kill -9` + restart recovery; 4 MB ring wrap with a lock in an old session and an oversized lock refused |
 | | `dev <user@node>` | cross-build, copy to `/tmp`; same scenario on the board with Wave5: main run into `/rec`, crash and ring runs in `/rec/check-crash`, `/rec/check-ring` (recreated each run) |
-| `tests/nodeagent-check.sh` | `host` | build, unit tests; `nodeagent` on port 18080 (temp recordings, system clock, x265 960x600), driven with `curl` + `tools/icd-json`: identity, arm (+ busy), lock and health while recording, fetch while recording, disarm, sessions, segments, fetch last 5 s and whole session -> `sei-dump`, unlock, error replies |
+| `tests/nodeagent-check.sh` | `host` | build, unit tests; `nodeagent` on port 18080 (temp recordings, system clock, x265 960x600), driven with `curl` + `tools/icd-json`: identity, arm (+ busy), lock and health while recording, fetch while recording, disarm, sessions, segments, fetch last 5 s and whole session -> `sei-dump`, unlock, error replies; then one `fwt-rec` recording (5 s, fetched in 2 s parts, `sei-dump`, sidecar JSON parsed) |
 | | `dev <user@node>` | laptop + board builds; `nodeagent` started on the board (port 8080, `/rec`, Wave5, PTP clock); same scenario over the network; `nodeagent` stopped at the end |
 | `tests/camemu-check.sh` | `host` | build, unit tests; `trigd` + `cam-emu` + `nodecap --src emu` (x265, 960x600, **30 fps**), 600 edges: clean run; faults (drop/extra/late/sequence jump) whose counts must match the emulator's plan; window of ¼ period refused; ±2 ms jitter warns; emulator killed mid-session -> gaps, no hang. `sei-dump` pixel check on each stream: no frame bound to a wrong edge |
 | | `dev <user@node>` | laptop + board builds; clean and fault runs on the board at **60 fps**, 1920x1200, Wave5, PTP clock; streams copied back, `sei-dump` here; the emulator must keep real time (delivery lag < one period) |
@@ -341,7 +341,26 @@ ssh root@10.42.0.132 \
 # board: stop (an armed session is disarmed first)
 ssh root@10.42.0.132 'pkill -INT -x nodeagent'
 ```
-From the laptop: `curl` for HTTP, `tools/icd-json` for CBOR <-> JSON (laptop only, venv). Request keys in the ICD's order.
+**Record from the laptop: `fwt-rec`** (C, libcurl; DL-28). One recording on one node: checks the node is idle, arms a new session, waits on the node's PTP clock until T0 + duration, disarms (always, also on Ctrl-C), fetches the whole session into one file, writes `FILE.json` next to it and checks the file with `sei-dump`.
+```sh
+cd ~/Dima_CoWork && \
+mkdir -p ~/rec && \
+build-host/src/tools/fwt-rec/fwt-rec 10.42.0.132 \
+  --duration 30 --fps 60 --out ~/rec/run1.h265
+```
+- Options: `--fps N` (default 30; checked against the node's range), `--session N` (default: a new random number, DL-20), `--fetch-s N` (fetch part size, default and max 600 s), `-q` (no progress); `host:port` (default port 8080).
+- Expected end: `check: passed: summary: pictures N … pixels ok`, then `OK`. Exit code: 0 recorded, nothing missing, check passed; 1 failed or something missing; 2 usage.
+- Refused while the node records; Ctrl-C disarms and keeps what was recorded (JSON: `"interrupted": true`); a second Ctrl-C skips the fetch.
+- `FILE.json`: tool and node versions, laptop start time, plan (session, fps, T0, period), what the node recorded (index range, frames, missing, truncated), file (bytes, frames, fetches, missing ranges), check result.
+- Progress frames grow per closed 4 s segment (`/health` counts closed segments).
+- Runs on any Linux box with libcurl, the board included (cross-built in `build-board/src/tools/fwt-rec/`; check "not run" there: no `sei-dump`):
+  ```sh
+  scp build-board/src/tools/fwt-rec/fwt-rec root@10.42.0.132:/tmp/ && \
+  ssh root@10.42.0.132 \
+    '/tmp/fwt-rec 127.0.0.1 --duration 10 --out /tmp/onboard.h265'
+  ```
+
+**By hand:** `curl` for HTTP, `tools/icd-json` for CBOR <-> JSON (laptop only, venv). Request keys in the ICD's order.
 ```sh
 J="$HOME/Dima_CoWork/.venv/bin/python -I $HOME/Dima_CoWork/tools/icd-json"; \
 U=http://10.42.0.132:8080/v1; \
