@@ -39,7 +39,7 @@
 #define SRC_MAX_QUEUED 4  /* frames waiting in appsrc before we drop */
 
 struct opts {
-	const char *sock_path, *enc, *out_path, *log_path, *enc_extra;
+	const char *sock_path, *enc, *out_path, *log_path, *enc_extra, *level;
 	int w, h;
 	unsigned bitrate;  /* bit/s */
 	int64_t count;
@@ -88,6 +88,7 @@ static void usage(const char *prog)
 		"  --width W --height H   frame size (default 1920x1200)\n"
 		"  --bitrate BPS      target bitrate, bit/s (default 5000000)\n"
 		"  --enc-extra STR    extra v4l2 controls, appended as \",STR\"\n"
+		"  --level L          H.265 level for v4l2 (default 5; \"\" = encoder default)\n"
 		"  --out FILE         output H.265 byte stream (default nodecap.h265)\n"
 		"  --log FILE         per-frame CSV log\n"
 		"  --count N          stop after N edges\n"
@@ -105,6 +106,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		{ "height", required_argument, NULL, 'H' },
 		{ "bitrate", required_argument, NULL, 'b' },
 		{ "enc-extra", required_argument, NULL, 'x' },
+		{ "level", required_argument, NULL, 'L' },
 		{ "out", required_argument, NULL, 'o' },
 		{ "log", required_argument, NULL, 'l' },
 		{ "count", required_argument, NULL, 'n' },
@@ -116,7 +118,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	int c;
 
 	*o = (struct opts){ .sock_path = FWT_TRIGD_SOCK_DEFAULT, .enc = "v4l2",
-			    .out_path = "nodecap.h265", .enc_extra = "",
+			    .out_path = "nodecap.h265", .enc_extra = "", .level = "5",
 			    .w = 1920, .h = 1200, .bitrate = 5000000 };
 	while ((c = getopt_long(argc, argv, "qh", lo, NULL)) != -1) {
 		switch (c) {
@@ -126,6 +128,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		case 'H': o->h = atoi(optarg); break;
 		case 'b': o->bitrate = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'x': o->enc_extra = optarg; break;
+		case 'L': o->level = optarg; break;
 		case 'o': o->out_path = optarg; break;
 		case 'l': o->log_path = optarg; break;
 		case 'n': o->count = strtoll(optarg, NULL, 0); break;
@@ -248,16 +251,24 @@ static int build_pipeline(struct nodecap *nc)
 	gchar *desc;
 	GError *err = NULL;
 
+	/*
+	 * Wave5's level comes from caps negotiation (the hevc_level control is
+	 * overridden): without a level in the caps it signals an invalid one.
+	 * 1920x1200 needs level 5.
+	 */
+	gchar *lvl = *o->level ? g_strdup_printf("! video/x-h265,level=(string)%s ", o->level)
+			       : g_strdup("");
+
 	if (!strcmp(o->enc, "v4l2"))
 		desc = g_strdup_printf(
 			"appsrc name=src ! v4l2h265enc extra-controls=\"controls,"
 			"frame_level_rate_control_enable=1,video_bitrate=%u,"
 			"video_bitrate_mode=1,video_gop_size=%d,"
-			"prepend_sps_and_pps_to_idr=1%s%s\" "
+			"prepend_sps_and_pps_to_idr=1%s%s\" %s"
 			"! h265parse config-interval=-1 "
 			"! video/x-h265,stream-format=byte-stream,alignment=au "
 			"! appsink name=sink sync=false",
-			o->bitrate, fps, *o->enc_extra ? "," : "", o->enc_extra);
+			o->bitrate, fps, *o->enc_extra ? "," : "", o->enc_extra, lvl);
 	else
 		desc = g_strdup_printf(
 			/* x265enc takes I420, not NV12: convert (laptop only) */
@@ -267,6 +278,7 @@ static int build_pipeline(struct nodecap *nc)
 			"! video/x-h265,stream-format=byte-stream,alignment=au "
 			"! appsink name=sink sync=false",
 			o->bitrate / 1000, fps);
+	g_free(lvl);
 
 	if (!o->quiet)
 		fprintf(stderr, "nodecap: pipeline: %s\n", desc);

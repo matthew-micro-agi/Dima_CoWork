@@ -113,7 +113,7 @@ trigger-driven test source (now) │ AR023x -> CSI2RX3 -> v4l2src -> tiovxisp (c
 | `video_bitrate`, `video_bitrate_mode` | per AC §2, CBR | bitrate target |
 | `video_gop_size` | = fps | keyframe every 1 s |
 | `prepend_sps_and_pps_to_idr` | 1 | default 0; headers before every keyframe, so every 4 s segment decodes on its own (verified) |
-| `hevc_level` | 5 | 1920x1200 exceeds level 4.1; the default signals a wrong level (still "10" in `nodecap` output) *(verify)* |
+| level | 5, via caps `video/x-h265,level=(string)5` after the encoder | 1920x1200 exceeds level 4.1. The `hevc_level` control is overridden by caps negotiation (without a caps level the stream signals an invalid "10"); verified: stream signals 150 = level 5 |
 | input caps | `colorimetry=bt709`, `interlace-mode=progressive`, width/height multiples of 8 | the encoder only accepts caps with these fields set explicitly (a missing field = not-negotiated) |
 
 - **End of stream:** Wave5 does not forward EOS; `nodecap` treats "every pushed frame came out" as drained.

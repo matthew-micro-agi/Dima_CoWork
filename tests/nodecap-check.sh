@@ -88,6 +88,11 @@ run_dev() {
 	scp -q "$NODE:/tmp/nc-check.h265" "$NODE:/tmp/nc-check.csv" "$D/" &&
 		pass "copied stream back" || { fail "scp from $NODE"; return 1; }
 	check_stream board "$D/nc-check.h265" 300 0 0
+	local lv
+	lv=$(ffprobe -v error -select_streams v:0 -show_entries stream=level -of csv=p=0 \
+		"$D/nc-check.h265")
+	[ "$lv" = "150" ] && pass "board stream: H.265 level 5 signalled (150)" ||
+		fail "board stream: level ${lv:-?}, want 150 (level 5)"
 }
 
 case "$MODE" in
