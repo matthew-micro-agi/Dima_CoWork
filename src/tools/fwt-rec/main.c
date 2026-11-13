@@ -183,7 +183,7 @@ static void shq(char *dst, size_t cap, const char *s)
 	dst[k] = '\0';
 }
 
-/* sei-dump: $FWT_SEI_DUMP, next to us in the build tree, or on PATH. */
+/* sei-dump: $FWT_SEI_DUMP, next to us (host bundle bin/), in the build tree, or on PATH. */
 static int find_sei_dump(char *path, size_t cap)
 {
 	const char *env = getenv("FWT_SEI_DUMP");
@@ -197,9 +197,15 @@ static int find_sei_dump(char *path, size_t cap)
 	n = readlink("/proc/self/exe", self, sizeof(self) - 1);
 	if (n > 0) {
 		self[n] = '\0';
-		snprintf(path, cap, "%s/../sei-dump/sei-dump", dirname(self));
-		if (access(path, X_OK) == 0)
-			return 0;
+
+		const char *dir = dirname(self);
+		const char *rel[] = { "sei-dump", "../sei-dump/sei-dump" };
+
+		for (size_t k = 0; k < 2; k++) {
+			snprintf(path, cap, "%s/%s", dir, rel[k]);
+			if (access(path, X_OK) == 0)
+				return 0;
+		}
 	}
 	FILE *p = popen("command -v sei-dump 2>/dev/null", "r");
 

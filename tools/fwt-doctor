@@ -263,11 +263,12 @@ g_node() {
 		WARN) warn "$msg" "$fix" ;;
 		FAIL) fail "$msg" "$fix" ;;
 		INSTALLED)
-			# installed version vs this checkout
-			if ! $IN_REPO || ! head=$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null); then
+			# installed version: a test build? vs this checkout?
+			if [ "${msg%-dirty}" != "$msg" ]; then
+				warn "fwtrial $msg installed: built from uncommitted changes (a test build)" \
+					"deploy a release: deploy.sh $NODE from a clean checkout or host bundle   (docs/setup.md 8.6)"
+			elif ! $IN_REPO || ! head=$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null); then
 				ok "fwtrial $msg installed"
-			elif [ "${msg%-dirty}" != "$msg" ]; then
-				warn "fwtrial $msg installed: built from uncommitted changes" "commit, then deploy/deploy.sh $NODE   (docs/setup.md 8.6)"
 			elif [ "${msg##*-g}" != "$head" ]; then
 				warn "fwtrial $msg installed, this checkout is $head" "deploy/deploy.sh $NODE if the board should run it   (docs/setup.md 8.6)"
 			else
