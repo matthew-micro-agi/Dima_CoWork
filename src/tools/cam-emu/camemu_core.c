@@ -181,6 +181,8 @@ int ce_deliver(struct ce_stream *st, struct ce_bufq *q, const struct ce_faults *
 
 /* ---- pattern ---- */
 
+static void render(struct ce_pattern *p, uint8_t *nv12, struct ce_rng *r);
+
 int ce_pattern_init(struct ce_pattern *p, int w, int h, int amp, struct ce_rng *r)
 {
 	memset(p, 0, sizeof(*p));
@@ -202,7 +204,22 @@ int ce_pattern_init(struct ce_pattern *p, int w, int h, int amp, struct ce_rng *
 	for (int k = 0; k < 2; k++)
 		for (int x = 0; x < w + 2 * p->square; x++)
 			p->row[k][x] = ((x / p->square + k) & 1) ? 190 : 60;
+
+	p->frame_size = (size_t)w * h * 3 / 2;
+	p->pre = malloc(p->frame_size * CE_PRE_FRAMES);
+	if (!p->pre) {
+		ce_pattern_free(p);
+		return -ENOMEM;
+	}
+	for (int k = 0; k < CE_PRE_FRAMES; k++)
+		render(p, p->pre + (size_t)k * p->frame_size, r);
 	return 0;
+}
+
+void ce_pattern_fill(struct ce_pattern *p, uint8_t *nv12)
+{
+	memcpy(nv12, p->pre + (size_t)(p->next % CE_PRE_FRAMES) * p->frame_size, p->frame_size);
+	p->next++;
 }
 
 void ce_pattern_free(struct ce_pattern *p)
@@ -210,11 +227,13 @@ void ce_pattern_free(struct ce_pattern *p)
 	free(p->noise);
 	free(p->row[0]);
 	free(p->row[1]);
+	free(p->pre);
+	p->pre = NULL;
 	p->noise = NULL;
 	p->row[0] = p->row[1] = NULL;
 }
 
-void ce_pattern_fill(struct ce_pattern *p, uint8_t *nv12, struct ce_rng *r)
+static void render(struct ce_pattern *p, uint8_t *nv12, struct ce_rng *r)
 {
 	int period = 2 * p->square;
 	int shift = (int)((p->frame * 4) % (uint64_t)period);

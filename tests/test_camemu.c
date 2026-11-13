@@ -201,8 +201,8 @@ static void test_pattern_stamp(void)
 	ce_rng_seed(&r, 6);
 	CHECK(ce_pattern_init(&p, w, h, 12, &r) == 0);
 	CHECK(fwt_stamp_geom_default(w, h, &g));
-	ce_pattern_fill(&p, a, &r);
-	ce_pattern_fill(&p, b, &r);
+	ce_pattern_fill(&p, a);
+	ce_pattern_fill(&p, b);
 	CHECK(memcmp(a, b, (size_t)w * h) != 0);  /* it moves */
 	size_t out_of_range = 0;
 

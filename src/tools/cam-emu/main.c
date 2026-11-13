@@ -74,6 +74,7 @@ struct emu {
 
 	/* counters (whole run) */
 	uint64_t edges, dropped, extra, late, not_streaming, send_fail, clients;
+	int64_t  lag_max;  /* delivered this late after the frame's timestamp, ns */
 };
 
 static volatile sig_atomic_t g_stop;
@@ -100,7 +101,7 @@ static void usage(const char *prog)
 		"  --seq-jump PCT     sequence skips 1-3 without a lost frame (default 0)\n"
 		"  --noise N          noise amplitude, Y levels 0-100 (default 12)\n"
 		"  --seed N           random seed (default 1)\n"
-		"  --truth FILE       CSV per frame: sequence,t_mono_ns,index,kind\n"
+		"  --truth FILE       CSV per frame: sequence,t_mono_ns,index,kind,lag_ns\n"
 		"  --once             exit when trigd ends its session\n"
 		"  -v                 print every frame\n",
 		prog, FWT_CAMEMU_SOCK_DEFAULT, FWT_TRIGD_SOCK_DEFAULT);
@@ -348,6 +349,9 @@ static void do_reqbufs(struct emu *e, const struct fwt_cam_msg *m)
 		reply(e, FWT_CAM_REQBUFS, err, NULL, -1);
 		return;
 	}
+	/* Allocate the pages now, as a driver does: first touch of 3.5 MB per
+	 * buffer during streaming made the first frames ~10 ms late (board). */
+	memset(e->mem, 0, len);
 	e->nbufs = (int)m->count;
 	ce_bufq_init(&e->q, e->nbufs);
 	r.count = m->count;
@@ -429,10 +433,13 @@ static void accept_client(struct emu *e)
 
 /* ---- frames ---- */
 
-static void truth_line(struct emu *e, const char *seq, int64_t t, int64_t index, const char *kind)
+/* lag: how late the frame was handed over after its timestamp (-1: not handed over) */
+static void truth_line(struct emu *e, const char *seq, int64_t t, int64_t index, const char *kind,
+		       int64_t lag)
 {
 	if (e->truth)
-		fprintf(e->truth, "%s,%" PRId64 ",%" PRId64 ",%s\n", seq, t, index, kind);
+		fprintf(e->truth, "%s,%" PRId64 ",%" PRId64 ",%s,%" PRId64 "\n", seq, t, index, kind,
+			lag);
 }
 
 static void deliver(struct emu *e, const struct ce_event *ev)
@@ -448,7 +455,7 @@ static void deliver(struct emu *e, const struct ce_event *ev)
 
 	snprintf(seqs, sizeof(seqs), "%" PRIu32, seq);
 	if (slot < 0) {
-		truth_line(e, seqs, ev->due_ns, ev->index, "lost_nobuf");
+		truth_line(e, seqs, ev->due_ns, ev->index, "lost_nobuf", -1);
 		if (e->o.verbose)
 			fprintf(stderr, "cam-emu: seq %u index %" PRId64 " lost: no buffer\n",
 				seq, ev->index);
@@ -458,7 +465,7 @@ static void deliver(struct emu *e, const struct ce_event *ev)
 	uint8_t *buf = e->mem + (size_t)slot * e->buf_size;
 	uint32_t stamp = ev->kind == CE_SPURIOUS ? FWT_CAM_STAMP_SPURIOUS : (uint32_t)ev->index;
 
-	ce_pattern_fill(&e->pat, buf, &e->rng);
+	ce_pattern_fill(&e->pat, buf);
 	fwt_stamp_draw(buf, (int)e->w, buf + (size_t)e->w * e->h, (int)e->w, (int)e->w,
 		       (int)e->h, &e->geom, stamp);
 
@@ -470,18 +477,22 @@ static void deliver(struct emu *e, const struct ce_event *ev)
 	m.bytesused = fwt_cam_nv12_size(e->w, e->h);
 	m.t_mono_ns = ev->due_ns;
 	int r = fwt_cam_send(e->client_fd, &m, -1);
+	int64_t lag = fwt_mono_now_ns() - ev->due_ns;
+
+	if (lag > e->lag_max)
+		e->lag_max = lag;
 
 	if (r) {
 		/* client not reading: the buffer stays ours, the frame is gone */
 		e->send_fail++;
 		e->st.delivered--;
 		ce_bufq_queue(&e->q, slot);
-		truth_line(e, seqs, ev->due_ns, ev->index, "lost_send");
+		truth_line(e, seqs, ev->due_ns, ev->index, "lost_send", -1);
 		if (r != -EAGAIN)
 			drop_client(e, strerror(-r));
 		return;
 	}
-	truth_line(e, seqs, ev->due_ns, ev->index, ce_kind_str(ev->kind));
+	truth_line(e, seqs, ev->due_ns, ev->index, ce_kind_str(ev->kind), lag);
 	if (e->o.verbose)
 		fprintf(stderr, "cam-emu: seq %u slot %d index %" PRId64 " %s t %" PRId64 "\n",
 			seq, slot, ev->index, ce_kind_str(ev->kind), ev->due_ns);
@@ -521,7 +532,7 @@ static void on_edge(struct emu *e, const struct fwt_trig_msg *m)
 	e->edges++;
 	if (dropped) {
 		e->dropped++;
-		truth_line(e, "", edge_mono, m->index, "dropped");
+		truth_line(e, "", edge_mono, m->index, "dropped", -1);
 	}
 	for (int k = 0; k < n; k++) {
 		if (ev[k].kind == CE_SPURIOUS)
@@ -584,7 +595,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		setvbuf(e.truth, NULL, _IOLBF, 0);
-		fprintf(e.truth, "sequence,t_mono_ns,index,kind\n");
+		fprintf(e.truth, "sequence,t_mono_ns,index,kind,lag_ns\n");
 	}
 	e.listen_fd = listen_on(e.o.sock_path);
 	if (e.listen_fd < 0) {
@@ -652,8 +663,9 @@ int main(int argc, char **argv)
 	printf("summary: edges %" PRIu64 ", planned: dropped %" PRIu64 " extra %" PRIu64
 	       " late %" PRIu64 "; delivered %" PRIu64 ", seq_jumps %" PRIu64 ", lost_nobuf %"
 	       PRIu64 ", lost_send %" PRIu64 ", not_streaming %" PRIu64 ", clients %" PRIu64
-	       ", sched_overflow %" PRIu64 "\n",
+	       ", sched_overflow %" PRIu64 ", max delivery lag ms %.3f\n",
 	       e.edges, e.dropped, e.extra, e.late, e.st.delivered, e.st.seq_jumps,
-	       e.st.lost_nobuf, e.send_fail, e.not_streaming, e.clients, e.sched.overflow);
+	       e.st.lost_nobuf, e.send_fail, e.not_streaming, e.clients, e.sched.overflow,
+	       e.lag_max / 1e6);
 	return 0;
 }

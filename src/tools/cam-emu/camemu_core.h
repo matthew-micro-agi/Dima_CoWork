@@ -106,13 +106,21 @@ void ce_stream_on(struct ce_stream *st);
 int ce_deliver(struct ce_stream *st, struct ce_bufq *q, const struct ce_faults *f,
 	       struct ce_rng *r, uint32_t *seq);
 
-/* ---- content: moving checkerboard + per-pixel noise ---- */
+/* ---- content: moving checkerboard + per-pixel noise ----
+ * CE_PRE_FRAMES frames rendered once at init and then copied in turn: a
+ * noisy 1920x1200 frame takes ~20 ms to render on the board's A53, longer
+ * than a 60 fps period; a copy is what a camera's DMA costs anyway. */
+#define CE_PRE_FRAMES 8
+
 struct ce_pattern {
 	int      w, h, square;
 	int8_t  *noise;      /* w*h + CE_NOISE_SLACK values in [-amp, amp] */
 	size_t   noise_len;
 	uint8_t *row[2];     /* two checkerboard rows, w + 2*square long */
 	uint64_t frame;
+	uint8_t *pre;        /* CE_PRE_FRAMES rendered NV12 frames */
+	size_t   frame_size;
+	uint64_t next;       /* next pre-rendered frame to hand out */
 };
 
 #define CE_NOISE_SLACK 65536
@@ -120,8 +128,8 @@ struct ce_pattern {
 /* amp: noise amplitude in Y levels (0 = none). Returns 0 or -ENOMEM/-EINVAL. */
 int  ce_pattern_init(struct ce_pattern *p, int w, int h, int amp, struct ce_rng *r);
 void ce_pattern_free(struct ce_pattern *p);
-/* Fill the next frame (NV12, stride w): the board moves 4 px per frame,
- * the noise moves randomly. */
-void ce_pattern_fill(struct ce_pattern *p, uint8_t *nv12, struct ce_rng *r);
+/* Copy the next frame (NV12, stride w) into nv12: the board moves 4 px per
+ * frame, the noise moves randomly; the sequence repeats every CE_PRE_FRAMES. */
+void ce_pattern_fill(struct ce_pattern *p, uint8_t *nv12);
 
 #endif
