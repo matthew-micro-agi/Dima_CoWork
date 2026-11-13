@@ -6,8 +6,9 @@
  *   frame: capture timestamp (monotonic) from the source
  *
  * A frame belongs to the edge whose time + expected latency is nearest, if
- * within +- window (default half a period). Several frames for one edge: the
- * nearest wins, the others are spurious. An edge is decided once its window
+ * within +- window (nodecap: 3 ms, always below a quarter period). Several
+ * frames for one edge: the nearest wins, the others are spurious. An edge is
+ * decided once its window
  * has passed (a later frame arrived, or the clock moved beyond it + grace):
  * then it comes out with its frame, or without one (a gap). The frame index
  * always comes from the edge, never from counting frames.

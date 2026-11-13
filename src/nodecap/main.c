@@ -73,6 +73,7 @@ struct stats {
 	uint64_t rec_frames, rec_skipped, rec_errors, locks_ok, locks_refused;
 	/* camera sources (emu) */
 	uint64_t cam_frames, cam_before_start, seq_jumps, seq_skipped;
+	uint64_t cam_wide;  /* bound frames beyond half the window */
 };
 
 struct nodecap {
@@ -122,7 +123,8 @@ static void usage(const char *prog)
 		"  --cam-sock PATH    cam-emu socket (default %s)\n"
 		"  --cam-bufs N       camera buffers (default 4)\n"
 		"  --cam-latency-ms X expected edge -> frame timestamp (default 25)\n"
-		"  --cam-window-ms X  accept frames +- X around edge + latency (default: half period)\n"
+		"  --cam-window-ms X  accept frames +- X around edge + latency (default 3;\n"
+		"                     must be < period/4, DL-27)\n"
 		"  --clock phc|sys    trigd's clock, for edge -> monotonic time (default phc)\n"
 		"  --dev PATH         PTP device (default /dev/ptp0)\n"
 		"  --enc v4l2|x265    encoder: Wave5 (board) or software (laptop) (default v4l2)\n"
@@ -179,7 +181,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 
 	*o = (struct opts){ .sock_path = FWT_TRIGD_SOCK_DEFAULT, .enc = "v4l2",
 			    .cam_sock = FWT_CAMEMU_SOCK_DEFAULT, .cam_bufs = 4,
-			    .cam_latency_ns = 25000000,
+			    .cam_latency_ns = 25000000, .cam_window_ns = 3000000,
 			    .enc_extra = "", .level = "5", .ctl_path = REC_CTL_SOCK_DEFAULT,
 			    .src_name = "test",
 			    .seg_seconds = 4, .lock_cap_pct = 20,
@@ -225,9 +227,10 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		fprintf(stderr, "nodecap: --src must be test or emu\n");
 		return -1;
 	}
-	if (o->cam_bufs < 2 || o->cam_bufs > FWT_CAM_MAX_BUFS || o->cam_latency_ns < 0) {
-		fprintf(stderr, "nodecap: --cam-bufs 2..%d, --cam-latency-ms >= 0\n",
-			FWT_CAM_MAX_BUFS);
+	if (o->cam_bufs < 2 || o->cam_bufs > FWT_CAM_MAX_BUFS || o->cam_latency_ns < 0 ||
+	    o->cam_window_ns <= 0) {
+		fprintf(stderr, "nodecap: --cam-bufs 2..%d, --cam-latency-ms >= 0, "
+			"--cam-window-ms > 0\n", FWT_CAM_MAX_BUFS);
 		return -1;
 	}
 	if (strcmp(o->enc, "v4l2") && strcmp(o->enc, "x265")) {
@@ -483,6 +486,14 @@ static int start_session(struct nodecap *nc, const struct fwt_trig_msg *m)
 		nc_fps_of(nc->period_ns), nc->t0_ns, m->index);
 	nc->started = true;
 	if (nc->by_time) {
+		/* From a quarter period on, a frame late by 3/4 period lands inside
+		 * the next edge's window and can take its index (DL-27). */
+		if (nc->o.cam_window_ns >= nc->period_ns / 4) {
+			fprintf(stderr, "nodecap: --cam-window-ms %.2f must be below a quarter "
+				"period (%.2f ms at %d fps)\n", nc->o.cam_window_ns / 1e6,
+				nc->period_ns / 4 / 1e6, nc_fps_of(nc->period_ns));
+			return -1;
+		}
 		struct nc_match_cfg mc = { .period_ns = nc->period_ns,
 					   .latency_ns = nc->o.cam_latency_ns,
 					   .window_ns = nc->o.cam_window_ns };
@@ -567,6 +578,12 @@ static void push_decided(struct nodecap *nc, int64_t now_mono)
 		struct nc_edge e = { .index = d.index, .t_ns = d.t_ns, .session = d.session,
 				     .flags = d.flags };
 
+		/* bound, but far out in the window: the window is tight for this camera */
+		if (d.dist_ns > nc_match_window(&nc->match) / 2 && nc->st.cam_wide++ == 0)
+			fprintf(stderr, "nodecap: WARNING: frame for edge %" PRId64 " %.2f ms from "
+				"edge + latency, more than half the window (+- %.2f ms): measure the "
+				"camera's spread (DL-27)\n", d.index, d.dist_ns / 1e6,
+				nc_match_window(&nc->match) / 1e6);
 		push_buffer(nc, (GstBuffer *)(uintptr_t)d.tag, &e);
 	}
 
@@ -1014,9 +1031,9 @@ int main(int argc, char **argv)
 		printf("camera: frames %" PRIu64 ", bound %" PRIu64 ", spurious %" PRIu64
 		       " (no edge %" PRIu64 ", nearer frame won %" PRIu64 "), edges without frame %"
 		       PRIu64 ", sequence jumps %" PRIu64 " (skipped %" PRIu64 "), before session %"
-		       PRIu64 ", latency ms min/mean/max %.3f/%.3f/%.3f (expected %.3f, window +-%.3f)\n",
+		       PRIu64 ", beyond half window %" PRIu64 ", latency ms min/mean/max %.3f/%.3f/%.3f (expected %.3f, window +-%.3f)\n",
 		       s->cam_frames, ms->bound, ms->no_edge + ms->lost, ms->no_edge, ms->lost,
-		       ms->no_frame, s->seq_jumps, s->seq_skipped, s->cam_before_start,
+		       ms->no_frame, s->seq_jumps, s->seq_skipped, s->cam_before_start, s->cam_wide,
 		       have_lat ? ms->lat_min / 1e6 : 0, have_lat ? mean / 1e6 : 0,
 		       have_lat ? ms->lat_max / 1e6 : 0, nc.o.cam_latency_ns / 1e6,
 		       nc.started ? nc_match_window(&nc.match) / 1e6 : 0);
