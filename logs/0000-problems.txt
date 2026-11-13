@@ -1,0 +1,117 @@
+0000-problems.txt: bench problems (J722S EVM, J722SXH01EVM)
+Started 2026-11-12. Linux console = FTDI if02 (/dev/ttyS2 on target), R5 firmware console = if00.
+
+P1  Board reset loop during Linux boot                       [resolved]
+    Resolved: board on a proper USB-C PD supply boots to login on the unmodified reference
+             image and stays up (up 11 min, load ~0.02, no resets).
+    Seen:    Hard reset 4-9 s after kernel start, right when udev powers up drivers
+             (DSP attach, xHCI, GPU...). No panic/oops/watchdog message; UART cut mid-line.
+             init=/bin/sh (no drivers) is stable.
+    Ruled out: remoteproc (blacklisted, still reset), rti_wdt watchdog (blacklisted, still
+             reset), systemd runtime watchdog (only RebootWatchdogSec=60 is set).
+    Cause:   EVM powered from a monitor USB-A port via a USB-C to USB-A cable: 5 V only, no PD,
+             about 2.5-12 W. Brownout when Linux powers up USB3/PCIe/GPU.
+             (Linux cannot confirm it: no typec/power_supply driver for the PD controller.)
+    Fix:     USB-C PD supply 65 W or more, with a C-to-C cable, into the EVM power connector.
+    Blocked: all on-target work (camera, encoder, eMMC) until fixed.
+    Ask:     a dedicated USB-C PD supply for the bench (Matthew).
+
+P2  SD image is the Edge AI SDK; remote-core firmware is older than the rest   [restored, irrelevant]
+    Final:   Not a fault. The resets were P1 (power). Original uEnv.txt restored and
+             no-rproc.conf removed; the reference image runs stable with all remote cores
+             (2x C7x, main R5) attached. The R5/C7x are likely needed for the TI ISP path.
+             The changes below were reverted.
+    Seen:    uEnv.txt has dorprocboot=1 and name_overlays=ti/k3-j722s-edgeai-apps.dtbo; U-Boot
+             starts the C7x/R5 cores with firmware from MCU SDK 09.00, while system firmware
+             and Linux are SDK 11.0.
+    Done:    dorprocboot=0, name_overlays commented out in uEnv.txt (SD boot partition);
+             /etc/modprobe.d/no-rproc.conf blacklists ti_k3_dsp_remoteproc and
+             ti_k3_r5_remoteproc. Original kept at uEnv.txt.orig on the SD boot partition.
+    Note:    Might not be a real fault (P1 was the actual reset cause). Not needed for the slice.
+
+P3  Board boots from SD, not eMMC                                    [info]
+    SD 116 GB (mmcblk1, root on p2). eMMC 29.6 GB (mmcblk0, p1+p2, contents unknown).
+    Software: Arago 2025.01, kernel 6.12.17-ti, U-Boot 2025.01, TF-A 2.12,
+    system firmware 11.0.9. SoC J722S SR1.0 HS-FS.
+
+P4  No RTC time: the system clock reads March 2025 at boot           [open]
+    Needs NTP or PTP before any UTC timestamps on triggers or segments mean anything.
+
+P5  ESP32 not needed                                                [closed]
+    The trial brief is partly out of date. Actual bench: J722S EVM with a camera plugged in.
+    No ESP32 or supervisor-MCU stand-in in scope for now.
+    Camera model and CSI connector: TBD (check with media-ctl -p once Linux is up).
+
+P6  Laptop user was not in the dialout group                         [resolved]
+
+P7  Camera not detected on any EVM camera connector                 [open, hardware; stated gap]
+    Module:  AR0234 (confirmed by owner). Came with a 20-pin cable; tested with a 22-pin cable.
+             No other marking found ("AWM 20624" on the old cable = UL cable rating, not a camera ID).
+    EVM:     22-pin camera connectors (TI SPRUJB5, Fig. 2-1/2-2, Tables 2-6..2-9, 2-20):
+               Camera 1 = J33 (bottom, CSI0)   Camera 2 = J34 (bottom, CSI1)
+               Camera 3 = J2  (top,    CSI2)   Camera 4 = J1  (top,    CSI3)
+             Pinout = Raspberry Pi 22-pin camera standard: 4 lanes + clock, pin 17 CAM_PWDN,
+             pin 18 CAM_AUX, pins 20/21 I2C, pin 22 3.3 V. No MCLK, no other rails.
+             Camera  I2C bus (TCA9543 on i2c-4)    enable pin (pin 17)   pad
+               1     i2c-5 (mux 0x70 ch0)          GPIO0_15              0x03c
+               2     i2c-6 (mux 0x70 ch1)          GPIO0_17              0x044
+               3     i2c-7 (mux 0x71 ch0)          GPIO0_19              0x04c
+               4     i2c-8 (mux 0x71 ch1)          GPIO0_21              0x054
+             GPIO0 = 600000.gpio (gpiochip number changes between boots; look it up by address).
+             IO expander TCA6424 i2c-2 0x23: P00 TRC_MUX_SEL (trace mode, affects camera),
+             P04 CSI_VIO_SEL (= SW2.4), P06/P07 CSI01/CSI23_MUX_SEL_2 (1 = 22-pin connectors).
+             SW2 = 8-way DIP switch, top side right of J2; SW2.4 ON = 3.3 V camera I/O (default).
+    Image:   Camera overlays: quad imx219, quad tevi-ov5640 only. Drivers: imx219, ov5640 only.
+             No AR0234 driver or overlay (also none in TI SDK 11.02, none in mainline 6.12).
+    Checked (2026-11-12/13), all with no I2C device found:
+      - Live device tree before tests: only k3-j722s-edgeai-apps.dtbo; no sensor nodes, all four
+        CSI-2 receivers disabled, no runtime overlays.
+      - Quad imx219 overlay loaded (uEnv.txt): sets both mux lines, enable pads to GPIO mode
+        (pad 0x054 = 0x00050007), enable pins as reset-gpios. imx219 probe: -121 (no ACK) on
+        all four buses. Side issue: CSI-2 receiver 30121000 (Camera 2) IRQ conflict.
+      - Enable pins held high by hand (gpioset), full i2cdetect on i2c-5..8: nothing besides
+        the TCA9543 muxes (UU 0x70/0x71). Done with the module in J1 and in J2, and with all
+        four enable pins high at once.
+      - Without the overlay, mux lines driven by hand: nothing (not conclusive: pads not GPIO).
+      - IO expander registers: TRC_MUX_SEL low (trace off), CSI_VIO_SEL = 1 (3.3 V, SW2.4 ON),
+        CSI01/CSI23_MUX_SEL_2 high.
+      - Cable: 22-pin, contacts facing the connector springs at both ends, latches closed.
+      - Overlay removed again afterwards (2026-11-13); uEnv.txt.orig kept as backup.
+    Conclusion: board side (mux, pads, enable, I/O level, trace, pinout) is correct.
+             Cause is the cable type (same-side vs opposite-side contacts), the module's
+             pinout or power reaching the module.
+    Next (hardware, in order):
+      1. Multimeter, enable held (ssh -t root@10.42.0.132 'gpioset -c gpiochip2 21=1'):
+         J1 pin 22 = 3.3 V and pin 17 = 3.3 V, then the same pins at the module end.
+         Missing at the module end -> cable; present -> module/pinout.
+      2. Try the other cable type (opposite-side vs same-side contacts).
+      3. Module ID: maker, part number, pinout or schematic (ask Matthew); is it RPi-style
+         22-pin, does it need MCLK or extra rails, colour or mono, trigger pad (TRIG/XVS).
+      4. Prove the board path with a known-good RPi camera (e.g. IMX219, supported by TI's
+         overlay): confirms connector + CSI + capture end to end.
+      5. If the module is not RPi-style: an RPi-pinout AR0234 module (e.g. Arducam) or an adapter.
+    Even when detected: AR0234 driver port + our overlay; module must be built against the
+             board kernel (6.12.17, 11.0 image; our SDK is 6.12.57) or the board moved to 11.02;
+             ISP tuning for a colour sensor. Estimate 1-2 days to raw capture (guess).
+    Decision (2026-11-12, kept 2026-11-13): camera is a stated gap; the slice continues on the
+             trigger-driven test source (A3). Camera is a pluggable input later.
+
+P8  Board had no network connection                                 [resolved]
+    Board eth0 is cabled directly to the laptop built-in port enp0s31f6 (Intel, hardware
+    timestamping). NetworkManager profile "board-link" (ipv4.method shared) on the laptop:
+    laptop 10.42.0.1, board 10.42.0.132 via DHCP, with NAT to the laptop Wi-Fi.
+    SSH root@10.42.0.132 works without a password. Board eth0 has hardware PTP (/dev/ptp0).
+    Undo: nmcli con delete board-link.
+
+P10 Laptop Intel I219 hardware clock runs ~1600 ppm off               [worked around]
+    Seen:    P-3 run 1: board PTP slave could not follow (frequency pinned at +488 ppm max,
+             offset growing ~1 ms/s, negative path delay).
+    Cause:   laptop PHC (enp0s31f6, /dev/ptp0 on the laptop) drifts ~1600 ppm vs the NTP-synced
+             system clock (phc_ctl cmp, 10 s apart). Likely the e1000e driver assumes the wrong
+             crystal frequency for this I219. Board CPTS is fine (~57 ppm).
+    Fix:     run phc2sys on the laptop alongside ptp4l (sudo):
+               phc2sys -s CLOCK_REALTIME -c enp0s31f6 -O 0 -m
+             The driver accepts the ~-1600 ppm correction; P-3 run 2 then passed (30 ns RMS).
+    Impact:  bench only. The laptop works as grandmaster only with phc2sys running.
+             Product: real grandmaster + NIC qualification per hardware type (decision log DL-01).
+    Gap:     absolute accuracy not measured (architecture G2).

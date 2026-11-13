@@ -1,0 +1,72 @@
+0002-what_to_do.txt: open tasks and how to do them
+Started 2026-11-12.
+
+Scope decisions (2026-11-12)
+    - Single node only: build a good, reliable single-node prototype. No second board.
+      Multi-node sync (levels 2/3) stays described, not shown.
+    - No logic analyzer for now; ask only with a concrete reason. Trigger timing is measured
+      from CPTS hardware timestamps (GENF1 -> HW3_TS_PUSH loop); pin-level measurement
+      stays described.
+    - Camera later: start without camera input, trigger-driven test source (A3).
+    - eMMC is ours: the whole device becomes /rec.
+
+T1  Identify the camera plugged into the J722S EVM                   [deferred: camera later]
+    Order: try the cheapest step first, stop as soon as the model is known.
+
+    1. Ask Matthew: camera model, vendor, which CSI connector, any adapter board.
+
+    2. Look at the hardware:
+       - Markings on the module PCB or flex: IMX219, RPi Camera v2.1, Arducam, OV5640, AR0234...
+       - Connector: flat ribbon (15/22-pin) = RPi-style module (often IMX219);
+         coax/FAKRA through an adapter board = FPD-Link camera (IMX390, OV2312...).
+       - Note which of the 4 EVM camera connectors it sits in.
+
+    3. Ask the sensor over I2C (works from init=/bin/sh, which is stable even on weak power):
+         mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev 2>/dev/null
+         for b in 5 6 7 8; do echo "== bus $b"; i2cdetect -y -r $b; done
+       (buses 5-8 = the camera-connector I2C behind two PCA9543 switches on i2c-4, at 0x70 and 0x71)
+
+       Address seen -> likely sensor:
+         0x10  IMX219, or onsemi AR023x
+         0x3c  OV5640
+         0x1a  IMX477 / IMX708
+         0x3d  DS90UB960 FPD-Link deserializer (camera sits behind it)
+
+       Confirm with the chip ID register (B = bus where it answered):
+         i2ctransfer -y B w2@0x10 0x00 0x00 r2   # IMX219 -> 0x02 0x19
+         i2ctransfer -y B w2@0x10 0x30 0x00 r2   # onsemi AR023x chip ID (reg 0x3000)
+         i2ctransfer -y B w2@0x3c 0x30 0x0a r2   # OV5640 -> 0x56 0x40
+
+       Nothing on any bus -> the camera's power/enable likely needs its device-tree overlay
+       (the Edge AI overlay is disabled, see 0000-problems.txt P2). Then use step 2 and
+       apply the matching camera overlay.
+
+    4. Once Linux boots normally (after P1 power fix): media-ctl -p, v4l2-ctl --list-devices.
+
+    Why it matters: the product sensor is AR0235 and TI has no driver for it.
+      AR023x on the bench -> close to the real sensor.
+      Anything else (e.g. IMX219) -> pipeline stand-in; the AR0235 driver is its own task.
+
+T2  Connect the board to Ethernet                                    [open]
+    The USB cable to the laptop carries only the serial console (FTDI UART), no network.
+    The board needs a real Ethernet cable for SSH, NTP, file transfer and later PTP.
+    EVM port: CPSW port 1 (U-Boot: eth0: ethernet@8000000port@1); ask Matthew if unsure.
+
+    Laptop state (2026-11-12):
+      enx94105aa9f8d2 (USB Realtek adapter): 1 Gbit link into the office network
+        (sees router 192.168.1.1 and an unknown 192.168.1.55), although it is
+        configured as 172.16.0.1/24.
+      enp0s31f6 (built-in Intel port): nothing plugged in.
+
+    Option A (now, simplest): board -> office switch/router.
+      Board gets DHCP 192.168.1.x and internet; NTP sets the clock by itself (P4).
+      On the board console: ip -br addr   -> then from laptop: ssh root@<addr>
+      Check whether 192.168.1.55 is already the board.
+
+    Option B (later, for PTP): board -> laptop built-in port enp0s31f6, direct cable.
+      Static IPs or NetworkManager "shared" connection. The Intel port can do hardware
+      timestamping (check: ethtool -T enp0s31f6); the USB Realtek adapter cannot.
+
+T4  Before 30-min measurement runs: stop idle extra services          [open]
+    Running but idle on the board: containerd, pulseaudio, ofono, snmpd, strongswan,
+    netserver, avahi, lldpd, mstpd, atd, rpcbind. Stop them for repeatable numbers (M6).

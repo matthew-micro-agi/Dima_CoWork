@@ -1,0 +1,347 @@
+0004-measurements-to-do.txt: what we measure on the J722S node, and how
+Started 2026-11-12. Brief 5.3: "numbers, not claims". Each item: what, why, how, status.
+Board: root@10.42.0.132. Commands longer than one line use "\" continuations.
+
+PRE-CODING CHECKS (confirm assumptions before writing our code)
+
+P-1 Encoder baseline (Wave5 via GStreamer)                   [done 2026-11-12]
+    Setup: 60 noise frames (videotestsrc pattern=snow) rendered once to /tmp/snow.nv12
+           (207 MB, RAM disk), looped into the encoder. Noise = worst case for the encoder.
+    Pipeline (works):
+      gst-launch-1.0 -e multifilesrc location=/tmp/snow.nv12 loop=true \
+        ! rawvideoparse format=nv12 width=1920 height=1200 framerate=30/1 colorimetry=bt709 \
+        ! v4l2h265enc extra-controls="controls,frame_level_rate_control_enable=1,\
+            video_bitrate=5000000,video_bitrate_mode=1,video_gop_size=30,\
+            prepend_sps_and_pps_to_idr=1" \
+        ! h265parse ! filesink location=/tmp/p1_30.h265
+    Results:
+      Throughput   600 frames 1920x1200 in ~5.8 s -> ~100 fps (need 60), at 30 and 60 fps
+      CPU          ~1.1 cores, mostly the looping source copying 3.5 MB frames
+      Bitrate      noise: ~22 Mbps @60 (target 10), ~9 Mbps @30 (target 5) = upper bound;
+                   real camera content will be lower -> re-measure with a camera
+      Stream       HEVC Main, 1920x1200, yuv420p; keyframe every 30 frames at 30 fps
+                   (positions 1, 31, 61, ...); VPS/SPS/PPS before every keyframe (20 of 20)
+      Standalone   file cut at the 2nd keyframe decodes on its own (569 = 599 - 30 frames)
+      Timestamps   output PTS = input PTS for almost all frames, BUT at stream start one
+                   PTS (0.0333) never came out of the encoder and one (0.1667) appeared
+                   twice (the duplicate already came from the looping source).
+                   -> never trust the encoder to carry the index blindly; check at output.
+      Level        signalled as "10" (wrong); 1920x1200 needs HEVC level 5 (picture size
+                   exceeds level 4.1) -> set hevc_level explicitly (verify)
+    Dead ends on the way:
+      - videotestsrc renders in software: ~10 fps (ball, snow) / ~42 fps (smpte) at 100 %
+        of one core. First run measured the source, not the encoder.
+      - Rate control is OFF by default (frame_level_rate_control_enable=0): video_bitrate
+        ignored, fixed QP 30 -> ~1 MB/frame on noise.
+      - rawvideoparse -> v4l2h265enc: not-negotiated until colorimetry=bt709 is set
+        (encoder accepts only explicit colorimetry; capssetter did not help).
+      - identity eos-after did not stop exactly at N (599 of 600; ~60 instead of 10):
+        don't use it for exact frame counts.
+    Follow-up with nodecap (2026-11-13), appsrc -> v4l2h265enc, 300 trigger edges @30 fps:
+      Result       300 edges -> 300 frames, all matched by PTS, no gap/duplicate/backward;
+                   10 keyframes; 5.9 MB / 10 s (5 Mbps target); 300 SEIs; decodes on laptop;
+                   drawn index read back from decoded frame 150. Start-of-stream PTS loss
+                   from above NOT seen in this run (output check stays in place).
+      Caps         appsrc caps must also carry interlace-mode=progressive (encoder caps
+                   list it explicitly; a missing field doesn't match -> not-negotiated).
+                   Width/height multiples of 8. rawvideoparse sets these fields itself.
+      EOS          the encoder never forwards EOS: drain ends when all pushed frames came out.
+      Level        still signalled as "10" (not a valid level_idc).
+                   hevc_level control: menu 0..8 = 1, 2, 2.1, 3, 3.1, 4, 4.1, 5, 5.1.
+                   nodecap --enc-extra hevc_level=7 (= 5): run clean (60/60, sei-dump ok)
+                   but the stream signals level 30 = 1.0: v4l2h265enc sets the level from
+                   caps negotiation and overrides the control.
+                   FIX: caps filter video/x-h265,level=(string)5 after the encoder.
+                   gst-launch, 60 frames: no caps -> level 10, caps level 5 -> 150 (= 5).
+                   nodecap --level (default 5); nodecap-check.sh dev checks level 150.
+      Laptop       x265enc needs I420 (videoconvert in front) and shifts output PTS by
+                   1000 h (recorded in the segment): read PTS as stream time, never raw.
+      WARNING      laptop x265 at 1920x1200 can't sustain 30 fps: 900-edge runs dropped
+                   ~25 % (232-286 frames), with or without the recorder (2026-11-13).
+                   nodecap detects and reports every drop. Laptop checks therefore run at
+                   960x600 (nodecap-check.sh, recorder-check.sh host); the board (Wave5,
+                   ~100 fps capacity) runs full resolution. Laptop drops say nothing about
+                   the node.
+
+P-2 CPTS loop sanity (testptp)                     [done 2026-11-12, gap found; closed 2026-11-13]
+    Why:  find which Linux perout index = GENF1 and which extts index = HW3_TS_PUSH,
+          and that the loop delivers timestamps at the set rate. trigd depends on it.
+    How:  ~/fwtrial/prereq/p2-cpts/build.sh cross-compiles testptp.c straight from the SDK
+          kernel tree (not copied; GPL), using the kernel's own UAPI ptp_clock.h (the
+          sysroot's is older: no PTP_MASK_* ioctls). Binary copied to the board /tmp.
+            /tmp/testptp -d /dev/ptp0 -c                  capabilities
+            /tmp/testptp -d /dev/ptp0 -i 1 -p 33333333    periodic output 1 @ 30 Hz
+            timeout 3 /tmp/testptp -d /dev/ptp0 -i N -e 5 read 5 events, N = 0..3
+            /tmp/testptp -d /dev/ptp0 -i 1 -p 0           output off
+    Results:
+      Capabilities  2 periodic outputs, 4 external timestamp channels, 0 PPS,
+                    0 programmable pins, max freq adjust 488281 ppb
+      CPTS clock    500 MHz (dmesg: "CPTS ... freq:500000000 ... pps:0") -> 2 ns resolution
+      PHC time      ~4250 s (1970): free-running from boot, nothing syncs it yet (P-3)
+      Perout        request OK; it is NOT stopped when the fd closes (ptp_release only
+                    frees the event queue) -> trigd must disable the output explicitly
+      Extts 0..3    NO events on any input within 3 s
+    Cause (live device tree of the 11.0 image):
+      - CPTS node has no "ti,pps"; timesync router (mux-controller@a40000) node is absent.
+      - The GENF1 -> HW3_TS_PUSH loop exists only in the 11.02 SDK EVM tree
+        (ti,pps = <2 1>, timesync router: K3_TS_OFFSET(12, 0x0001ffff, 17)).
+      - So on the current image nothing routes an output back into a timestamp input.
+    Fix chosen (gap, not a blocker): a device-tree overlay that adds the timesync router
+      with mux-reg-masks-state = <0x34 0x0001ffff 0x10011> (output 12 = HW3_TS_PUSH <-
+      input 17 = GENF1), without ti,pps (so trigd owns GENF1). Checked prerequisites:
+      CONFIG_MUX_MMIO=y, TI's "mux-reg-masks-state" extension present in the board kernel
+      Image, bus label cbass_main exists, bus cells 2/2, overlays load from /boot/dtb/ti/
+      via name_overlays in uEnv.txt, dtc in the SDK.
+      Source: ~/fwtrial/dts/k3-j722s-evm-fwtrial-cpts-loop.dtso. NOT deployed.
+    Until then: trigd runs in computed-time mode (t_k = T0 + k*period); M4 jitter and
+      edge-fired proof need the overlay (measured mode).
+    Closed 2026-11-13 (setup.md 7): overlay deployed via name_overlays (backup
+      uEnv.txt.pre-g1), router node in the live tree (status okay, driver mmio-mux).
+      testptp: output 1 at 60 Hz -> events on input 2 every 16.666666 ms, +8..+14 ns
+      from the nominal edge time. trigd --edges auto now measured (see M4).
+    Dead end: find on the board does not follow the /proc/device-tree symlink; read
+      /sys/firmware/devicetree/base instead.
+
+P-3 PTP link sanity (ptp4l)                                  [done 2026-11-12, passed]
+    Why:  hardware timestamping end to end over the direct cable; rough offset.
+    Setup: default 1588 settings, layer 2 (-2), NOT yet the gPTP profile.
+      laptop (sudo):  ptp4l -i enp0s31f6 -2 -m --tx_timestamp_timeout=50       (master)
+      board:          timeout 120 ptp4l -i eth0 -2 -s -m > /tmp/p3_ptp4l.log    (slave only)
+    Run 1 (laptop ptp4l only)                                         FAILED
+      board reached SLAVE, but master offset grew ~1.05 ms/s (2.8 ms -> 116 ms in ~110 s),
+      board freq pinned at +488281 ppb (its max), path delay NEGATIVE (-200..-630 us).
+    Diagnosis: each hardware clock vs its own NTP-synced system clock, 10 s apart
+      board:  /tmp/testptp -d /dev/ptp0 -k 1  -> +5.41 ms/10 s = ~540 ppm, of which +488 ppm
+              was ptp4l's leftover correction -> native ~50 ppm (normal crystal)
+      laptop: sudo phc_ctl enp0s31f6 cmp      -> +15.95 ms/10 s = ~1600 ppm (!)
+      -> the laptop's Intel I219 hardware clock runs ~1600 ppm off (likely driver assumes the
+         wrong crystal frequency). See 0000 P10.
+    Fix: discipline the laptop clock to its system clock (sudo, keep running):
+      phc2sys -s CLOCK_REALTIME -c enp0s31f6 -O 0 -m
+      -> freq -1,599,5xx ppb accepted by the driver, offset within ~±50 ns.
+      Board freq reset before run 2: /tmp/testptp -d /dev/ptp0 -f 0
+    Run 2 (laptop phc2sys + ptp4l)                                    PASSED
+      LISTENING -> UNCALIBRATED -> SLAVE in ~3 s
+      last 60 s: offset RMS 30 ns, max |offset| 85 ns
+      board freq -56.8 ppm (stable) = board crystal error
+      path delay +7.49 us (stable; large for one cable -> likely NIC-internal latency on the laptop)
+    Not measured: absolute accuracy (asymmetric delay invisible to PTP; needs PPS + scope).
+    Notes:
+      - ptp4l's frequency correction stays applied after ptp4l exits (reset with testptp -f 0).
+      - phc2sys -O 0 makes PTP time = UTC, not TAI (gPTP expects TAI) -> fix with gPTP config (A11).
+      - Board PHC now on UTC, free-running with -56.8 ppm applied; full log in board /tmp/p3_ptp4l.log.
+
+M1  eMMC read speed                                          [done 2026-11-13]
+    Why:  fetch/offload while recording; HS200 bus caps at ~200 MB/s.
+    How:  ssh root@10.42.0.132 \
+            'dd if=/dev/mmcblk0 of=/dev/null bs=1M count=512 iflag=direct; \
+             dd if=/dev/mmcblk0 of=/dev/null bs=4k count=20000 iflag=direct'
+    Results:
+      Sequential 1 MiB   173 MB/s (512 MiB, uncached)
+      4 KiB reads        43.7 MB/s = ~10,700 reads/s (sequential addresses, queue depth 1)
+      Bus                HS200, 200 MHz, 8-bit (/sys/kernel/debug/mmc0/ios)
+    Limits: dd is a quick sanity check only: one access pattern, queue depth 1, no random
+          access, no mixed read/write, short run (no thermal or garbage-collection effects).
+          Product qualification: fio with job files matching the recorder (sequential
+          segment writes + concurrent fetch reads, sustained for hours, latency percentiles,
+          full-disk behaviour), run on the real filesystem.
+
+M2  eMMC identity, health and wear                           [done 2026-11-13]
+    Why:  endurance is a risk for 24/7 recording.
+    How:  ssh root@10.42.0.132 \
+            'cd /sys/block/mmcblk0/device && \
+             for f in name manfid oemid date rev life_time pre_eol_info; do \
+               echo "$f: $(cat $f)"; done'
+    Results:
+      Part        Micron (manfid 0x13), "G1M15L", 09/2023, rev 0x8: the 32 GB part listed
+                  in TI's EVM guide (MTFC32GAZAQHD-IT)
+      Wear        life_time 0x01 0x01 = 0-10 % of rated wear used (both cell types)
+      Pre-EOL     0x01 = normal
+    Product: read wear and pre-EOL from EXT_CSD (mmc-utils) into node health; endurance
+          budget from the datasheet TBW vs recorded bytes per day.
+
+M3  eMMC write speed                                         [done 2026-11-13]
+    Why:  recorder headroom; need 0.6 MB/s (1080p30) to 1.2 MB/s (1080p60).
+    How:  /rec = whole eMMC, ext4 (setup.md section 6); freshly discarded device.
+          ssh root@10.42.0.132 \
+            'dd if=/dev/zero of=/rec/m3.bin bs=1M count=1024 oflag=direct conv=fsync; \
+             dd if=/dev/zero of=/rec/m3-4k.bin bs=4k count=20000 oflag=direct conv=fsync; \
+             rm -f /rec/m3.bin /rec/m3-4k.bin'
+    Results:
+      Sequential 1 MiB   96.5 MB/s (1 GiB, direct + fsync) = ~80x the 1080p60 need
+      4 KiB writes       36.6 MB/s = ~9,000 writes/s (sequential addresses, queue depth 1)
+    Limits: same as M1: dd on an empty, freshly discarded eMMC is the best case. A full,
+          aged ring (delete + rewrite, garbage collection) is slower. Product: fio, sustained
+          for hours on a full ring with concurrent fetch reads; keyframe fdatasync latency
+          percentiles; eMMC wear per day vs datasheet endurance.
+
+M4  Trigger interval jitter (CPTS)          [done 2026-11-13: exact unlocked; DRIFT with PTP locked]
+    Why:  the core timing claim; edges from hardware, not software.
+    How:  trigd arms GENF at 30/60 Hz, reads HW_TS_PUSH timestamps (GENF1 -> HW3_TS_PUSH
+          loop on the EVM); histogram of edge-to-edge intervals over 30+ min.
+    Later: logic analyzer on the trigger pin (J1 pin 18) to confirm at the connector.
+    How (now): tests/trigd-check.sh dev root@10.42.0.132 (trig-listen: interval - period
+          min/max/RMS + histogram, trigd: measured vs plan); by hand:
+            /tmp/trigd --session N --fps 60 --count 600 & /tmp/trig-listen -q
+    Results (board, PTP free-running, 300-600 edges):
+      60 fps       600/600 edges measured, 0 without timestamp; every interval = period
+                   (0 ns, all within the 2 ns resolution); constant +14 ns from T0 + k*P
+      30 fps       FOUND: interval = period - 1 ns on every edge (300/300) -> edges drift
+                   off the plan by 30 ppb (54 us per 30 min). Cause: the CPTS makes whole
+                   2 ns ticks; 33,333,333 ns is odd. Fix: periods in whole ticks (30 fps =
+                   33,333,334 ns). After: every interval = period (0 ns), 300/300.
+      Fallback     --extts 3 (no loop there): WARNING after 3 edges, computed times, 0 gaps
+    30 min with PTP locked (soak 2, M13): FOUND (gap G4): edges do NOT follow ptp4l's
+          frequency correction. Every captured interval ~950 ns long (57 ppm at 60 fps;
+          PHC freq correction -52..-58 ppm); edges drift off T0 + k*P by 57 us/s.
+          trigd: published 108,001 = measured 54,405 + TS_MISSING 53,596; events ignored
+          53,590 (beyond a quarter period off the plan); max 4.17 ms off the plan.
+          trig-listen: interval - period: half <= 2 ns (TS_MISSING edges = plan), half
+          <= 1 us (max +976 ns), 12 > 10 us.
+    Cause (driver source, am65-cpts.c am65_cpts_ptp_adjfine): the frequency correction
+          goes to the time counter and only to the GENF used as the kernel's PPS
+          (ti,pps); a PEROUT-requested GENF gets ppm 0 and is never updated. Our overlay
+          has no ti,pps (trigd owns GENF1) -> GENF1 runs at the crystal rate.
+          Before G1 (computed mode) the same drift existed with PTP locked, unseen.
+    Fix (planned, architecture 11.2 step 1): apply the correction to every enabled
+          GENF in adjfine (driver patch, module for the board's kernel); then repeat
+          this 30-min run with PTP locked. Pin-level with a logic analyzer.
+
+M5  PTP offset                                [done 2026-11-13 in M12, default 1588 profile]
+    Why:  trigger edges locked to network time; basis for multi-node sync.
+    How:  ptp4l on laptop Intel port (enp0s31f6) as master, board eth0 as slave;
+          log master offset over 30+ min; report RMS and max.
+
+M6  Encoder: sustained bitrate and CPU                       [done 2026-11-13 in M12, 60 fps]
+    Why:  proves Wave5 at 1920x1200 @30 and @60; sizes segments and ring.
+    How:  test source -> v4l2h265enc; segment sizes / time for bitrate;
+          top / pidstat per process for CPU.
+    Expect: ~5 Mbps @30, 8-10 Mbps @60; CPU low (hardware encode).
+
+M7  Frames captured vs dropped over 30+ min                  [todo, needs A3, A8]
+    Why:  "0 silent drops" is the key property.
+    How:  counters: triggers, frames, gaps, duplicates, spurious; plus checker on the
+          laptop reading SEI {session, index, t} from fetched files.
+    Also: inject drops on purpose in the test source; detection must report each one.
+
+M8  Ring reclaim and lock vs reclaim             [done small ring + 30 min / 500 MB ring in M12]
+    Why:  shows the ring works, not just writing.
+    How:  tests/recorder-check.sh host | dev root@10.42.0.132 (scenario 4): ring 4 MB,
+          2 Mbps, 240 frames in session 1, lock [0, 50] of session 1 while session 2
+          records 900 frames; then a lock over all of session 2.
+    Results (board, Wave5; laptop the same):
+      Wrap         900/900 frames recorded while wrapping, no errors; 7 segments reclaimed
+      Order        closed session reclaimed first, then the running session's oldest
+      Lock         locked segment of the closed session survived the wrap
+      Lock cap     oversized lock refused: 8.5 MB would exceed 2.0 MB (50 % of ring)
+      Disk use     ~2.5 MB <= 4 MB limit; rec-tool verify: no problems
+    Todo: long run as planned (ring ~500 MB, 30+ min at full resolution, count
+          reclaimed segments; with M7 soak).
+
+M9  "Last 90 s" query cost                                   [done 2026-11-13 in M12]
+    Why:  brief asks for a cheap index query.
+    How:  time GET /v1/segments and /v1/fetch for last 90 s with a full manifest.
+
+M10 Recovery                                                 [todo, needs A5, A7]
+    Why:  failure behaviour is part of the contract.
+    How:  pull power during recording -> boot -> session "interrupted", at most ~1 s lost;
+          unplug Ethernet -> recording continues, events queued;
+          kill nodecap / recorder -> systemd restart, gap reported, no silent shift.
+
+M11 Binding by time with the camera emulator                  [done 2026-11-13]
+    Why:  a camera delivers frames on its own clock; the index must come from the trigger
+          edge by timing alone (DL-27), never from counting frames. No camera yet (0000 P7):
+          cam-emu plays a triggered sensor and draws the true index into every frame.
+    How:  tests/camemu-check.sh dev root@10.42.0.132   (host: tests/camemu-check.sh host)
+          trigd (PTP clock) + cam-emu + nodecap --src emu, Wave5, 1920x1200, 60 fps,
+          600 edges; streams checked on the laptop with sei-dump (drawn index = SEI index).
+          By hand: docs/setup.md 8.3 "Camera emulator".
+    Results (board):
+      Clean        600/600 bound, 600 pictures, no gaps, pixels ok
+      Latency      measured 24.50-25.50 ms (configured 25 +- 0.5 jitter) -> conversion
+                   PTP -> monotonic adds no visible error
+      Faults       3 % drop/extra/late, 2 % sequence jump (seed 11): dropped 18, extra 23,
+                   late 12, jumps 10 -> nodecap: 30 edges without frame (= 18 + 12),
+                   35 spurious (= 23 + 12), 10 sequence jumps, 0 frames with a wrong index
+      Emulator     max delivery lag 3.4-3.8 ms after the frame's timestamp (< 16.7 ms period)
+    Found on the way:
+      Window       +- half period (8.3 ms at 60 fps) and +- 5 ms: 1 frame got the wrong index
+                   (a 3/4-period-late frame took the next edge whose own frame was dropped);
+                   +- 3 ms: none. Default now 3 ms, refused at >= 1/4 period (DL-27).
+      Render cost  one noisy 1920x1200 frame takes 19.6 ms on the A53 (> 16.7 ms period at
+                   60 fps): the emulator fell behind, frames arrived after nodecap had
+                   decided their edges (1 of 600 bound). Fix: 8 frames rendered once at
+                   start, then copied (a copy is what a camera's DMA costs).
+      First touch  first 4 frames delivered 8.8-14.2 ms late: the kernel allocating the
+                   shared buffers on first write (~850 pages each). Fix: buffers touched at
+                   allocation, as a driver does. Max lag then 3.4 ms.
+      Laptop       x265 can't keep up with noisy frames at 60 fps (drops in the encoder,
+                   binding still 600/600) -> laptop checks at 30 fps.
+    Limits: the emulator's latency is fixed; a real sensor's timestamp moves with exposure
+          time and has interrupt jitter -> measure the spread on the camera before setting the
+          window; sensor frame counter as second signal before a real camera is trusted
+          (DL-27 Later).
+
+M12 Soak: 30 min at 60 fps through the installed service       [done 2026-11-13, drops found + fixed]
+    Why:  sustained numbers on the real path (nodeagent -> trigd + nodecap + recorder),
+          ring wrapping under load, fetch while recording; the load = our processes.
+    How:  installed service with a temporary drop-in (EnvironmentFile /tmp/soak/soak.env:
+          RING_MAX_MB=500, NODECAP_ARGS=--enc v4l2 --bitrate 10000000 --src emu), removed
+          after; cam-emu clean as the frame source (sampled, not counted as load); sampler
+          every 10 s (/proc: CPU/RSS/threads per process, system, temperature, eMMC, /rec);
+          laptop: fwt-rec 10.42.0.132 --duration 1800 --fps 60, every 5 min --info + timed
+          "last 90 s" fetch, one lock at ~15 min; PTP: laptop grandmaster (setup.md 5).
+          Board: 0.1.0-gaf2df29-dirty (node binaries = committed code), 1920x1200, Wave5.
+    Results:
+      M5 PTP       28 summaries x 64 s: offset RMS median 52 ns (47..1559), max |offset|
+                   7.9 us (one disturbed minute); freq -51.8..-58.4 ppm; path delay 7487-7500 ns
+      M6 CPU       nodecap 33.3 % of one core (RSS 42 MB, 5 threads); trigd 0.5 %; nodeagent
+                   0.2 % -> load 34 % of one core = 8.5 % of the 4 A53 cores; whole system 13.9 %
+                   busy incl. cam-emu (13.5 % of a core); SoC 61-65 C; ~6.1 GB of 6.5 GB free
+      M6 bitrate   ~9.4 Mbps at a 10 Mbps target (noisy frames: upper bound); eMMC 1.20 MB/s
+      M8 ring      /rec at ~505 MB after ~6.5 min, segments reclaimed continuously; the lock
+                   [34097, 37697] (69 MB) survived every wrap and was fetched at the end
+      M9 last 90 s 6 fetches while recording + reclaiming: first byte 1.6-8 ms, ~100 MB in
+                   0.87-0.92 s
+      trigd        108,001 edges, 0 dropped to either subscriber
+      M7 frames    FAILED: 99,477 of 108,001 recorded, 8,524 missing (7.9 %); no frame with
+                   a wrong index (sei-dump pixels ok on the 24,897 decoded pictures)
+    Drops: cause, measured (60 s runs, same config):
+      A no recorder 0 missing; B recorder on /rec 327 missing -> the recorder path
+      timing counters: keyframe fdatasync avg 66-94 ms, max 0.7-1.0 s; segment close max
+        0.65 s; frame write max 1.5 ms -> eMMC sync latency, not throughput (1.2 MB/s)
+      the syncs ran in the encoder-output thread holding nodecap's shared lock; capture
+        waited for it (max 712 ms) -> the camera's 4 buffers (67 ms at 60 fps) ran out
+    Fix (src/nodecap): writer thread + bounded write queue (16 MB); capture never waits on
+      storage; main loop reads all edges, then frames, then decides by the clock; encoder
+      input limit 4 -> 8 frames (Wave5 start-up). After: B 3600/3600 with a 1.0 s fdatasync
+      during the run, capture waited max 2.5 ms; camemu-check dev (60 fps, recorder on the
+      eMMC) passes.
+    Todo: rerun the 30 min with the fixed build (deploy first); expect 0 missing.
+    Note for M3: dd showed 96 MB/s, but the sync LATENCY under a 10 Mbps stream is
+      66-94 ms on average and up to 1 s: design for it (never sync on the capture path).
+
+M13 Soak 2: 30 min at 60 fps, fixed build, PTP locked, measured edges [done 2026-11-13]
+    How:  as M12, board 0.1.0-g13c96fa (writer thread, measured edges, whole-tick
+          periods), CPTS loop overlay; laptop grandmaster (phc2sys + ptp4l) for the
+          whole run; trig-listen on the board as a third subscriber (M4); drop watchdog
+          on the laptop (--info every 20 s, alert at > 60 missing).
+    Results:
+      M7 frames    108,001 edges, 108,001 bound, 108,001 recorded: 0 missing, 0 spurious,
+                   0 dropped; watchdog never alerted
+      Storage      keyframe fdatasync avg 156 ms, max 1.2 s; segment close max 869 ms;
+                   segment open (reclaim) max 126 ms; write queue peak 1.6 MB of 16,
+                   overflow 0; capture waited max 2.4 ms (lock held max 3.5 ms)
+      M6 CPU       nodecap 33.3 %, trigd 1.0 %, nodeagent 0.4 % of one core -> 34.7 %
+                   (8.7 % of 4 cores); cam-emu 14.0 % (not load); SoC 62-66 C
+      M5 PTP       28 x 64 s: RMS median 51.5 ns (42..1613), max |offset| 7.8 us,
+                   freq -52.5..-58.4 ppm, path delay 7487-7511 ns
+      M8 ring      451 segments closed, 429 reclaimed; a new 73 MB lock refused by the
+                   20 % lock cap (soak 1's 75 MB lock still active): cap works as designed
+      M9 last 90 s first byte 1.5-2.1 ms, ~113 MB in 0.97-1.02 s (6 x, while recording
+                   and reclaiming)
+      Check        fwt-rec fetched the last 5.8 min (20,881 frames, 437.5 MB): sei-dump
+                   pixels ok, 0 gaps, 0 duplicates
+      M4           drift with PTP locked: see M4 (gap G4)
+    Note: cam-emu's max delivery lag 33.7 ms once (> a 60 fps period) without a lost
+          frame (4 buffers).

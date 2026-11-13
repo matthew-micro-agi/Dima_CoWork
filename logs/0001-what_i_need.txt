@@ -1,0 +1,6 @@
+- board check (sdcard), camera plug
+- ethernet cable
+- doc station maybe
+- sudo access
+- ai tooling
+- camera model: ar0234 or sc233

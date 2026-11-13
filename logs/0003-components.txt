@@ -1,0 +1,246 @@
+0003-components.txt: node components on the J722S EVM and what we build
+Started 2026-11-12. Tags: [OURS] our code, [TI] SoC/SDK, [EVM] this board.
+Ax = component that can be built now, without the camera (see list below).
+
+                         LAPTOP (bench stand-in for controller + PC)
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │  test tools / curl (A9) ──HTTP+CBOR──┐   ptp4l grandmaster (A11)        │
+   └──────────────────────────────────────┼──────────────┬────────────────────┘
+                                          │ eth          │ gPTP
+═════════════════════════════════════════╪══════════════╪══════════════════════
+ J722S EVM                                │              │
+                                          ▼              ▼
+  LINUX (A53)        ┌────────────────────┐    ┌──────────────────┐
+                     │ nodeagent (A7)     │    │ ptp4l / phc2sys  │
+                     │ [OURS] HTTP+CBOR   │    │ (A11)            │
+                     │ health, fetch (A6) │    │ PHC <-> sysclock │
+                     └───┬───────────▲────┘    └────────┬─────────┘
+              list/fetch │           │ health/events    │ PHC time
+              lock       ▼           │                  │
+                     ┌────────────────────┐             │
+                     │ recorder (A5)      │             │
+                     │ [OURS] 4 s segs,   │             │
+                     │ manifest, ring,    │             │
+                     │ locks              │             │
+                     └───▲───────────┬────┘             │
+          H.265 AUs +    │           │ write            │
+          SEI(idx, ts)   │           ▼                  │
+                     ┌───┴────────────────┐    ┌────────┴─────────┐
+                     │ nodecap [OURS]     │◄───│ trigd (A2)       │
+                     │ pipeline (A1)      │edge│ [OURS, C]        │
+                     │ SEI insert (A4)    │idx,│ arm GENF, read   │
+                     │ drop detect (A8)   │ ts │ HW_TS_PUSH events│
+                     │ test source (A3)   │    │                  │
+                     └─┬──────▲───────┬───┘    └──▲───────────┬───┘
+                       │      │       │           │ ioctl     │ ioctl
+                       │      │       │           │ (EXTTS)   │ (PEROUT)
+  ─────────────────────┼──────┼───────┼───────────┼───────────┼──────────────
+  HW / REMOTE CORES    ▼      │       ▼           │           ▼
+                ┌──────────┐  │ ┌──────────┐  ┌───┴───────────────────┐
+                │ VPAC ISP │  │ │  Wave5   │  │ CPTS (CPSW3G) [TI]    │
+                │ via TIOVX│  │ │  H.265   │  │ GENF1 ──► HW3_TS_PUSH │
+                │ on R5F + │  │ │  encoder │  │ (PPS loop on the EVM) │
+                │ C7x [TI] │  │ │  [TI]    │  │ GENF ──► FSIN pin     │
+                └────▲─────┘  │ └──────────┘  └───────────┬───────────┘
+                     │ RAW10  │ NV12                      │ FSIN (verify pin)
+                ┌────┴─────┐  │                           │
+                │ CSI2RX3  │  │                           │
+                │ [TI]     │  │                           │
+                └────▲─────┘  │                           │
+                     │ CSI-2  │                           │
+                ┌────┴─────────────┐                      │
+                │ J1 "Camera 4"    │ ◄────────────────────┘
+                │ [EVM] 22-pin     │   trigger to CAM_AUX / CAM_PWDN
+                └────▲─────────────┘
+                     │
+                ┌────┴─────────────┐          ┌──────────────────────────┐
+                │ AR0234 (blocked, │          │ eMMC /dev/mmcblk0        │
+                │ P7)              │          │ /rec/manifest.bin        │
+                └──────────────────┘          │ /rec/sNNNN/…  [EVM size] │
+                                              └──────────────────────────┘
+   Until the camera works: nodecap uses the trigger-driven test source (A3)
+   instead of CSI2RX -> ISP. A10 (soak/fault tests) exercises the whole node.
+
+Flow:
+  Timing: trigd arms the CPTS periodic output (GENF) -> trigger pin to the sensor;
+          the same edge returns into a CPTS timestamp input (loop exists on the EVM);
+          trigd reads the hardware timestamp and passes index + timestamp to nodecap.
+  Video:  sensor -> CSI2RX3 -> ISP on R5F/C7x (Bayer -> NV12) -> Wave5 (H.265);
+          nodecap writes index + timestamp into each frame's SEI, checks for drops,
+          hands complete frames to recorder.
+  Store:  recorder writes 4 s segments + manifest to eMMC; nodeagent serves the
+          control interface (HTTP + CBOR) and segment fetch; ptp4l aligns the PHC
+          with the laptop.
+
+Decisions (2026-11-12)
+  D1  Language: C for ALL on-node code (trigd, nodecap + recorder in one process, nodeagent).
+      Why: data path; GStreamer native API is C; SDK cross-toolchain ready; small footprint
+      (also fits RV1106: one A7, 128-256 MB RAM).
+      Considered Rust: likely the long-term choice (safety, gst-plugins-rs), but toolchain
+      setup too long for the prototype -> product option.
+      Rejected Python on the node: slower, less control, much more CPU/RAM than FW should use.
+      Laptop test tools are not firmware: language open.
+      HTTP library: libmicrohttpd 12.62.1, in the SDK sysroot AND on the board image.
+  D2  Control interface: HTTP transport (libmicrohttpd), versioned (/v1, icd version field).
+      Encoding: CBOR (RFC 8949), node speaks CBOR ONLY (application/cbor).
+      Schema: CDDL (RFC 8610), one .cddl per ICD version = the contract.
+      Code: zcbor generates C encode/decode with validation; generated code + runtime vendored.
+      Same library on the Linux node and Zephyr (zcbor is a Zephyr module).
+      Debug: JSON on the laptop only (cbor2json / icdctl CLI); no JSON code on the node.
+      Fetch: HTTP range requests, raw H.265. Events: SSE carrying CBOR (TBD).
+      Product: CoAP instead of HTTP for control/events; same CBOR messages.
+      Why CBOR: standard + interoperability + debuggable as JSON; Zephyr-native; pairs with CoAP.
+      Considered protobuf/nanopb: equally industry-normal, not self-describing, less Zephyr/CoAP-aligned.
+      Rejected: JSON on node, MessagePack, FlatBuffers, raw C structs/TLV (unportable).
+      SDK has neither CBOR nor protobuf libs: vendored either way.
+      Laptop setup needed later: pip zcbor, cbor2.
+  D3  Segments: 4 s (power of 2; whole frame counts: 120 @30 fps, 240 @60 fps;
+      ~2.5 MB @1080p30, ~5 MB @1080p60). Keyframe every 1 s (TBD), every segment starts
+      with a keyframe. Flush at every keyframe (crash loses at most ~1 s).
+  D4  GStreamer for the media path. Now: thin pipeline, our code at appsrc/appsink
+      (A1-A4). Logic written as plain functions so it can later be wrapped as our own
+      elements (trigsrc, trigsei, segmentsink) for a portable gst-launch pipeline.
+  D5  Camera: prefer one with an existing driver; trigger support decides which.
+      AR0235 driver = later milestone.
+  D6  Build system: CMake.
+      Why: one code base, two builds (laptop for unit tests, board cross-compiled via a small
+      toolchain file cmake/j722s-sdk.cmake -> SDK compiler + sysroot); pkg_check_modules for
+      GStreamer/libmicrohttpd against the sysroot; add_custom_command regenerates zcbor code
+      from the .cddl; ctest; compile_commands.json; standard Yocto cmake class later.
+      Considered plain Make: simpler, but two targets + pkg-config + codegen + tests get messy.
+      Considered Meson: GStreamer's own, nice for our future elements, but not installed;
+      CMake builds GStreamer plugins too. CMake is already on the laptop.
+
+Encoder and pipeline settings (from P-1, see 0004)
+  - Mandatory v4l2h265enc extra-controls:
+      frame_level_rate_control_enable=1   (default 0 = rate control OFF, bitrate ignored)
+      video_bitrate=<bps>, video_bitrate_mode=1 (CBR)
+      video_gop_size=<fps>                (keyframe every 1 s)
+      prepend_sps_and_pps_to_idr=1        (default 0; needed so every segment decodes alone)
+      hevc_level = 5                      (1920x1200 exceeds level 4.1; default signals "10")
+  - Source caps must include colorimetry=bt709 (encoder rejects buffers without it).
+  - A3 test source: never render frames per trigger (videotestsrc costs a full core at
+    10-40 fps); push pre-made buffers (render a few once, reuse).
+  - Wave5 capacity ~100 fps at 1920x1200: headroom for 60 fps.
+  - nodecap gives every frame a UNIQUE PTS (its trigger time), keeps a table
+    PTS -> {session, index}, and checks at the encoder OUTPUT: missing PTS = gap,
+    repeated PTS = duplicate (observed once each at stream start in P-1). Reported, never absorbed.
+
+Sessions (fix: tell recordings apart)
+  - Session ID assigned at arm/start; in the product the controller assigns it, so all
+    nodes share it. Same instant across cameras = same (session, index).
+  - Trigger index restarts at 0 per session.
+  - Files:    /rec/s0001/000000000.h265 … /rec/s0002/000000000.h265 …
+  - Manifest: {session, seg, first_idx, last_idx, t_first, t_last, bytes, flags,
+               keyframe byte offsets}
+  - SEI per frame: {session, index, t}
+  - A new session always starts a new segment; the last segment of a session may be short.
+  - Pause between sessions is not a drop; gap detection works within a session.
+  - API: GET /v1/sessions; GET /v1/fetch?session=N; GET /v1/fetch?from=…&to=… (by time).
+
+Frame <-> trigger matching (in nodecap)
+  - trigd hands {index, t_edge}; index computed from time: round((t - T0) / period),
+    so a lost event leaves a visible gap instead of shifting later indices.
+  - Frames matched to edges BY TIME, not by queue position:
+    t_frame - t_edge(k) ≈ expected latency (± tolerance).
+    Edge without frame = drop (gap); frame without edge = spurious.
+  - PHC time (edges) vs CLOCK_MONOTONIC (V4L2 frames) converted via phc2sys /
+    PTP system offset query.
+  - With the test source frames are made from edges, so binding is by construction;
+    drops are injected on purpose to test detection.
+
+Ring buffer (recorder)
+  - Ring = ordinary segment files on ext4 + a delete rule. No special circular area.
+  - Manifest on eMMC is the truth: every change appended immediately (+ fsync).
+    RAM index is a mirror, loaded once at boot. Compacted occasionally (new file + rename).
+  - Before each new segment: make_room(expected_segment_bytes + reserve).
+    free = min(statvfs free, ring_max_bytes - used). Small ring_max_bytes for tests.
+  - Victim order: 1. oldest CLOSED session, deleted whole (unlocked segments);
+                  2. oldest unlocked segment of the RUNNING session;
+                  3. none -> storage_full event (can't happen with the lock cap).
+  - Delete order: manifest "deleted" record + fsync -> unlink -> update RAM.
+  - Locks: per segment, with TTL; refused if locked bytes would exceed lock_cap (~20 %).
+  - Session status: recording / complete / truncated / interrupted.
+    Truncated sessions stay listed with their available ranges; fetch reports
+    missing ranges explicitly. A session disappears when its last segment is gone.
+  - Reset: eMMC keeps everything; RAM rebuilt from the manifest; only the last session
+    dir is checked; unfinished segment kept to its last flushed keyframe;
+    session marked interrupted; node reports "rebooted"; no automatic re-arm.
+  - Queries never scan the eMMC: list/segments from RAM, fetch reads only the needed files.
+    Manifest ~64 B/segment: 24 h = 21,600 segments ≈ 1.4 MB.
+  - One owner: recorder alone owns the index; nodeagent asks it over the local socket.
+  - Lightweight DB approach (SQLite) considered and rejected because:
+      writes are simple by construction (append-only, recovery checks the last few records);
+      multi-process access covered by the single owner; queries are fixed and few
+      (binary search is optimal); a DB costs several times more eMMC writes (WAL, pages,
+      checkpoints), a library of several hundred KB + SQL parsing, uncontrolled checkpoint
+      timing, one more dependency. Reconsider only for rich metadata or several writers.
+  - Partial fetch ("last 90 s" of a 180 s session), keyframe-aligned (option 2):
+      GET /v1/fetch?session=7&last_s=90
+      GET /v1/fetch?session=7&from_idx=2700&to_idx=5399      (same, at 30 fps)
+    Example: 180 s @30 fps = idx 0-5399, 45 segments; last 90 s = idx 2700-5399 ->
+    segments 22-44 (23 files), reading starts at the first keyframe >= 2700.
+    - Start precision = keyframe interval (<= 1 s at 1 s keyframes).
+    - Manifest record per segment also holds the byte offsets of its keyframes
+      (4 per 4 s segment), so nodeagent can start mid-file.
+    - Response states the actual range returned (from_idx, to_idx, times).
+    - Running session: includes the open segment up to its last flushed keyframe.
+    - Frame-exact trimming (if ever needed) is done on the client via the per-frame SEI.
+
+eMMC layout
+  - Trial (boots from SD): mmcblk0p1 = /rec, whole eMMC (~29.6 GB).
+  - Product (boots from eMMC): boot0/boot1 (hw, 31.5 MB) boot loaders; RPMB (hw, 4 MB) keys;
+    p1 rootfs A ~2 GB, p2 rootfs B ~2 GB, p3 /data ~256 MB, p4 /rec = rest.
+  - Manifest lives in /rec next to the segments; recorder keeps a free-space reserve for it.
+  - /rec must be a real eMMC partition, never tmpfs.
+  - Ring depth on the EVM (~25 GB usable): ~11 h @1080p30, ~5.5 h @1080p60.
+    Product: 8 h @30 ≈ 18 GB; 24 h @60 ≈ 108 GB.
+
+Enhancement (not in the trial slice): network offload
+  - Pull model: PC fetches via the existing API, then POST /v1/ack.
+  - Manifest flag "offloaded" (add the field now); reclaim prefers offloaded segments.
+  - Health reports offload backlog. Upload must outpace recording (AC §5 dock rule).
+  - No copy to SD (AC §5 rejects SD).
+
+Trigger -> camera binding (EVM, from SPRUJB5 Table 2-19)
+  - CPTS GENF -> pin mux (our overlay) -> SoC pad -> PCB trace -> connector pin -> sensor.
+  - J1 (Camera 4): pin 17 CAM_PWDN = GPMC0_AD6 / GPIO0_21 (reset in TI's IMX219 overlay),
+                   pin 18 CAM_AUX  = GPMC0_AD7 / GPIO0_22 (natural trigger line).
+  - Pins 17/18 go straight to SoC pads (not the I2C expander).
+  - Open (verify): can GENF or a timer output be muxed onto GPMC0_ADx?
+    yes -> overlay only; timer only -> discipline from PTP; neither -> jumper wire.
+  - I/O level 1.8 / 3.3 V via SW2.4 must match the module.
+
+A. Can be built and run now (no camera)
+  A1  Encode pipeline: test video NV12 1920x1200 @30/60 -> Wave5 (v4l2h265enc) -> our process.
+      Proves the hardware encoder; bitrate and CPU numbers.
+  A2  trigd (C): programs a CPTS periodic output at 30/60 Hz and reads hardware timestamps of
+      each edge via the Linux PTP interface. Measures trigger jitter on real silicon with no
+      extra wiring (GENF1 -> HW3_TS_PUSH loop exists on the EVM). Highest value first.
+  A3  Trigger-driven test source: one test frame per trigger edge, stamped with index + timestamp.
+      Stand-in for a sensor in slave mode.
+  A4  Per-frame metadata in the stream: trigger index + timestamp in each H.265 AU (SEI).
+  A5  Recorder: segment files, manifest, ring reclaim, lock with TTL, crash safety.
+      Can be developed and tested on the laptop first.
+  A6  Query/fetch: "last 90 s" and time ranges -> byte ranges.
+  A7  nodeagent: control interface server (list, fetch, lock/unlock, query time, health).
+  A8  Drop detection: compare consecutive frames' trigger index and sequence; report gaps.
+      Testable now by dropping frames in the test source on purpose.
+  A9  Node simulator + conformance tests: same control interface served by a fake node on the
+      laptop, one test suite run against both.
+  A10 Soak and fault tests: 30+ min run, unplug Ethernet, kill processes, fill the eMMC.
+  A11 PTP: ptp4l between the laptop Intel port and the board; PTP offset numbers.
+
+  Suggested order: A2 -> A1 + A3 + A4 -> A5 + A6 -> A7, A8 -> A10 -> A9 / A11 if time allows.
+
+B. Needs the camera (B replaces A3; everything in A stays)
+  B1  AR0234 driver: V4L2 subdevice, trigger/slave mode, manual exposure/gain, frame counter
+  B2  Device-tree overlay for J1 (signal switches, reset, I2C, CSI port)
+  B3  ISP path (TIOVX) raw Bayer -> NV12, basic tuning
+  B4  Real binding: trigger edge <-> sensor frame counter <-> capture sequence
+  B5  Exposure vs trigger edge measured with a logic analyzer on the sensor strobe/flash output
+
+C. Platform (design now, build later): Yocto layer, image from scratch, A/B updates,
+   secure boot, device identity.
+
+D. Controller and supervisor: design only, nothing on the bench.

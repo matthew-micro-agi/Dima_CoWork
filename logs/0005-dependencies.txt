@@ -1,0 +1,112 @@
+0005-dependencies.txt: dependencies for the J722S node, checked or still to bring up
+Started 2026-11-12. Status: OK = checked present; TODO = to install/vendor/verify.
+SDK = ~/ti/ti-processor-sdk-linux-adas-j722s-evm-11_02_02_05 (sysroot: linux-devkit/sysroots/aarch64-oe-linux)
+Board = root@10.42.0.132 (TI Edge AI image ~11.0, Arago 2025.01)
+
+1. Build-time: SDK sysroot (cross-compile for the board)
+   OK    aarch64-oe-linux-gcc cross-compiler      linux-devkit/environment-setup-aarch64-oe-linux
+   OK    linux/ptp_clock.h                        trigd: PTP_PEROUT_REQUEST, PTP_EXTTS_REQUEST
+   OK    gstreamer-1.0 (1.22.12)                  nodecap
+   OK    gstreamer-app-1.0                        nodecap: appsrc / appsink
+   OK    gstreamer-video-1.0                      nodecap
+   OK    gstreamer-codecparsers-1.0               nodecap: H.265 parsing, SEI insertion
+   OK    glib-2.0                                 nodecap (GStreamer base)
+   OK    libmicrohttpd (so.12.62.1)               nodeagent: HTTP server
+   OK    libsystemd                               optional: sd_notify readiness, watchdog
+   OK    glibc 2.39                               all; matches the board
+   n/a   recorder needs libc only (statvfs, fdatasync, rename)
+
+   Checked and NOT in the SDK (not needed or vendored instead):
+         CBOR libs (zcbor, tinycbor, libcbor, qcbor)      -> zcbor vendored (section 3)
+         protobuf / nanopb / protobuf-c                   -> not chosen (D2)
+         cJSON / jansson / json-c / json-glib             -> no JSON on the node (D2)
+         civetweb                                         -> libmicrohttpd chosen
+   Also present, not used: libsoup-3.0 (HTTP, GLib-based), libcurl (HTTP client).
+
+2. Runtime: board image
+   OK    libmicrohttpd.so.12.62.1                 same version as the SDK sysroot
+   OK    libsoup-3.0.so.0.7.1                     present, not used
+   OK    GStreamer elements: videotestsrc, appsrc, appsink, v4l2h265enc, h265parse
+   OK    GStreamer 1.22.12, glibc 2.39            match the SDK: cross-compiled apps run as-is
+   OK    ptp4l, phc2sys (/usr/sbin)               time (A11)
+   OK    mkfs.ext4                                /rec partition
+   OK    mmc (mmc-utils)                          eMMC health, EXT_CSD (M2)
+   OK    Wave5 encoder /dev/video1, PTP clock /dev/ptp0 (hardware timestamping on eth0)
+   OK    Remote cores (2x C7x, main R5F) attached: needed for the TI ISP path (tiovx*)
+   OK    gdbserver (/usr/bin/gdbserver)           remote debugging with gdb-multiarch
+   OK    Baseline: idle (load 0.00, ~94 % CPU idle, ~300 MB of ~6.5 GB RAM used); no Edge AI
+         demo or video service running. Extra idle services listed in 0002 T4.
+   TODO  tiovx* GStreamer elements (tiovxisp etc.): only needed with a camera; verify then
+   NOTE  Kernel mismatch: board 6.12.17 vs SDK 6.12.57. User space fine;
+         kernel modules/overlays need a matching kernel or a fresh 11.02 image.
+
+3. Vendored into the repo (~/fwtrial)
+   TODO  zcbor runtime (small .c/.h) + C code generated from the .cddl   nodeagent (D2)
+         Pin the zcbor version; record it in the decision log.
+
+4. Laptop: tools
+   OK    make, cmake                               build (D6: CMake)
+   OK    pkg-config                                dependency flags (with sysroot)
+   OK    python3, pip3                             tools
+   OK    curl                                      manual HTTP testing
+   OK    git                                       repo
+   OK    linuxptp: ptp4l, phc2sys (/usr/sbin)      laptop as PTP grandmaster (A11, M5); apt
+   OK    zcbor 0.9.1 (pip, venv)                   CDDL -> C code generator
+   OK    cbor2 5.9.0 (pip, venv, PINNED < 6)       JSON debug view (cbor2json / icdctl), tests
+   OK    pytest 9.2.0 (pip, venv)                  laptop-side tests (language for tests still open)
+         Python tools live in ~/fwtrial/.venv (Ubuntu 24.04 blocks system pip, PEP 668).
+         Versions: ~/fwtrial/tools-requirements.txt (pip freeze); reproduce with
+           python3 -m venv .venv && .venv/bin/pip install -r tools-requirements.txt
+   TODO  cmake/j722s-sdk.cmake                     our toolchain file -> SDK compiler + sysroot
+   n/a   meson, ninja                              not used (D6)
+
+   Dev packages for building/testing nodecap + nodeagent ON THE LAPTOP (apt):
+   OK    libgstreamer1.0-dev               1.24.2-1ubuntu0.1
+   OK    libgstreamer-plugins-base1.0-dev  1.24.2-1ubuntu0.6     (app, video)
+   OK    libgstreamer-plugins-bad1.0-dev   1.24.2-1ubuntu4+esm2  (codecparsers)
+   OK    libmicrohttpd-dev                 1.0.0-2.1ubuntu2
+   NOTE  Laptop GStreamer is 1.24.2, board/SDK is 1.22.12: laptop builds are for tests only;
+         board binaries are always built against the SDK sysroot. Avoid APIs newer than 1.22.
+
+   Verification and debug tools (apt):
+   OK    ffmpeg / ffprobe   6.1.1        inspect fetched H.265, playability, frame info
+   OK    gdb-multiarch      15.1         remote debugging on the board (gdbserver there: TODO check)
+   OK    valgrind           3.22.0       memory checks of C modules on the laptop
+   OK    cppcheck           2.13.0       static analysis
+   OK    clang-format       18           consistent formatting
+
+   Dead end (2026-11-12): zcbor 0.9.1 declares cbor2 >= 5.4.2 with no upper bound; pip
+   installed cbor2 6.2.1, which removed CBORDecodeValueError -> zcbor fails on import.
+   Fix: pin cbor2 < 6 (5.9.0). Note: cbor2 5.x has no __version__; use importlib.metadata.
+
+5. Laptop: network and access
+   OK    NetworkManager profile "board-link" on enp0s31f6 (shared, 10.42.0.1)
+   OK    SSH root@10.42.0.132 without password
+   OK    enp0s31f6 = Intel port: hardware TX/RX timestamping, PTP Hardware Clock 0,
+         PTPv2 L2/L4 filters (checked with ethtool -T) -> usable as PTP grandmaster
+   NOTE  ...but ONLY with phc2sys running: its hardware clock runs ~1600 ppm off (0000 P10).
+           sudo phc2sys -s CLOCK_REALTIME -c enp0s31f6 -O 0 -m    (terminal 1)
+           sudo ptp4l -i enp0s31f6 -2 -m --tx_timestamp_timeout=50 (terminal 2)
+
+6. Product image (later, Yocto)
+   TODO  Yocto config processor-sdk-analytics-11.02.02 (in SDK yocto-build/) + our layer
+   TODO  recipes for: libmicrohttpd, linuxptp, mmc-utils (expected in meta-oe/TI layers, verify);
+         zcbor code stays vendored in our sources
+   TODO  build host needs: repo/git, bitbake deps (large disk, hours)
+
+7. Hardware
+   OK    USB-C PD supply 65 W+ (P1 resolved)
+   OK    Ethernet cable board <-> laptop Intel port
+   LATER Camera with a driver in the TI SDK, ideally with external trigger support (P7).
+         Decision: start without camera input (test source A3).
+   LATER 20-to-22-pin adapter or a 22-pin RPi-style module, if the current camera stays (P7)
+   NOT NOW Logic analyzer: ask only with a concrete reason. Trigger timing from CPTS
+         hardware timestamps instead; pin-level measurement described, not shown.
+   NOT NOW Second board + switch: single-node prototype; sync level 2 described, not shown.
+   TODO  Optional: spare SD card for a fresh 11.02 image (kernel work)
+   OK    eMMC: ours, whole device -> /rec (mmcblk0p1).
+
+7b. PTP hardware on the board (checked 2026-11-12)
+   OK    /dev/ptp0 "CTPS timer" (TI CPTS): n_periodic_outputs 2, n_external_timestamps 4,
+         n_programmable_pins 0 (routing fixed by device tree), pps_available 0
+         (no kernel PPS claim -> GENF1 -> HW3_TS_PUSH free for trigd).
