@@ -9,5 +9,5 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GST REQUIRED IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0)
 
 add_executable(nodecap main.c)
-target_link_libraries(nodecap PRIVATE nodecap_core fwt_common PkgConfig::GST)
+target_link_libraries(nodecap PRIVATE nodecap_core recorder fwt_common PkgConfig::GST)
 install(TARGETS nodecap RUNTIME DESTINATION bin)

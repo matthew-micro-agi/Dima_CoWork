@@ -3,7 +3,9 @@
  *
  *   trigd edge -> test frame (index drawn in, DL-17) -> appsrc
  *     -> H.265 encoder -> h265parse -> appsink
- *     -> index from PTS (DL-15) -> per-frame SEI (DL-16) -> .h265 file + log
+ *     -> index from PTS (DL-15) -> per-frame SEI (DL-16)
+ *     -> recorder: segments, manifest, ring, locks in --rec DIR (DL-18..21)
+ *        and/or one .h265 file (--out), per-frame CSV (--log)
  *
  * Encoder: --enc v4l2 (Wave5 on the board, mandatory controls from the bench
  * test) or --enc x265 (software, laptop). The pipeline is built at the first
@@ -11,7 +13,11 @@
  *
  * Stops at trigd's END, after --count edges, or on Ctrl-C; then drains the
  * encoder (EOS) and prints a summary. Exit code 0 only if every edge produced
- * exactly one frame with its SEI (no gaps, duplicates, unmatched or dropped).
+ * exactly one frame with its SEI (no gaps, duplicates, unmatched or dropped)
+ * and, with --rec, every frame was recorded.
+ *
+ * With --rec, lock requests are served on a control socket (rec_ctl.h) while
+ * recording; the session number comes from trigd's plan (DL-20).
  */
 #include <errno.h>
 #include <getopt.h>
@@ -22,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -34,12 +41,17 @@
 #include "fwt_stamp.h"
 #include "fwt_trig_msg.h"
 #include "nodecap_core.h"
+#include "rec_ctl.h"
+#include "recorder.h"
 
 #define N_PATTERNS   8
 #define SRC_MAX_QUEUED 4  /* frames waiting in appsrc before we drop */
 
 struct opts {
 	const char *sock_path, *enc, *out_path, *log_path, *enc_extra, *level;
+	const char *rec_dir, *ctl_path;
+	uint64_t ring_max_mb;
+	int seg_seconds, lock_cap_pct;
 	int w, h;
 	unsigned bitrate;  /* bit/s */
 	int64_t count;
@@ -49,6 +61,7 @@ struct opts {
 struct stats {
 	uint64_t edges, pushed, dropped_in, frames_out, unmatched, keyframes, no_vcl;
 	uint64_t bytes;
+	uint64_t rec_frames, rec_skipped, rec_errors, locks_ok, locks_refused;
 };
 
 struct nodecap {
@@ -69,6 +82,9 @@ struct nodecap {
 	struct fwt_seqcheck chk;
 	struct stats st;
 	FILE *out, *log;
+	struct recorder rec;
+	bool rec_on;
+	int ctl_fd;
 };
 
 static volatile sig_atomic_t g_stop;
@@ -89,12 +105,17 @@ static void usage(const char *prog)
 		"  --bitrate BPS      target bitrate, bit/s (default 5000000)\n"
 		"  --enc-extra STR    extra v4l2 controls, appended as \",STR\"\n"
 		"  --level L          H.265 level for v4l2 (default 5; \"\" = encoder default)\n"
-		"  --out FILE         output H.265 byte stream (default nodecap.h265)\n"
+		"  --rec DIR          record into DIR (e.g. /rec): segments, manifest, ring\n"
+		"  --ring-max-mb N    ring size limit (default: filesystem minus reserve)\n"
+		"  --seg-seconds N    segment length (default 4)\n"
+		"  --lock-cap-pct N   max share of the ring that may be locked (default 20)\n"
+		"  --ctl-sock PATH    lock requests while recording (default %s)\n"
+		"  --out FILE         also/instead write one H.265 byte stream\n"
 		"  --log FILE         per-frame CSV log\n"
 		"  --count N          stop after N edges\n"
 		"  --no-sei           don't insert the SEI (debug)\n"
 		"  -q                 quiet: summary only\n",
-		prog, FWT_TRIGD_SOCK_DEFAULT);
+		prog, FWT_TRIGD_SOCK_DEFAULT, REC_CTL_SOCK_DEFAULT);
 }
 
 static int parse_opts(int argc, char **argv, struct opts *o)
@@ -108,6 +129,11 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		{ "enc-extra", required_argument, NULL, 'x' },
 		{ "level", required_argument, NULL, 'L' },
 		{ "out", required_argument, NULL, 'o' },
+		{ "rec", required_argument, NULL, 'R' },
+		{ "ring-max-mb", required_argument, NULL, 'M' },
+		{ "seg-seconds", required_argument, NULL, 'G' },
+		{ "lock-cap-pct", required_argument, NULL, 'C' },
+		{ "ctl-sock", required_argument, NULL, 'K' },
 		{ "log", required_argument, NULL, 'l' },
 		{ "count", required_argument, NULL, 'n' },
 		{ "no-sei", no_argument, NULL, 's' },
@@ -118,7 +144,8 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	int c;
 
 	*o = (struct opts){ .sock_path = FWT_TRIGD_SOCK_DEFAULT, .enc = "v4l2",
-			    .out_path = "nodecap.h265", .enc_extra = "", .level = "5",
+			    .enc_extra = "", .level = "5", .ctl_path = REC_CTL_SOCK_DEFAULT,
+			    .seg_seconds = 4, .lock_cap_pct = 20,
 			    .w = 1920, .h = 1200, .bitrate = 5000000 };
 	while ((c = getopt_long(argc, argv, "qh", lo, NULL)) != -1) {
 		switch (c) {
@@ -130,6 +157,11 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		case 'x': o->enc_extra = optarg; break;
 		case 'L': o->level = optarg; break;
 		case 'o': o->out_path = optarg; break;
+		case 'R': o->rec_dir = optarg; break;
+		case 'M': o->ring_max_mb = strtoull(optarg, NULL, 0); break;
+		case 'G': o->seg_seconds = atoi(optarg); break;
+		case 'C': o->lock_cap_pct = atoi(optarg); break;
+		case 'K': o->ctl_path = optarg; break;
 		case 'l': o->log_path = optarg; break;
 		case 'n': o->count = strtoll(optarg, NULL, 0); break;
 		case 's': o->no_sei = true; break;
@@ -139,6 +171,10 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	}
 	if (strcmp(o->enc, "v4l2") && strcmp(o->enc, "x265")) {
 		fprintf(stderr, "nodecap: --enc must be v4l2 or x265\n");
+		return -1;
+	}
+	if (!o->out_path && !o->rec_dir) {
+		fprintf(stderr, "nodecap: give --rec DIR and/or --out FILE\n");
 		return -1;
 	}
 	if (o->w <= 0 || o->h <= 0 || o->w % 2 || o->h % 2) {
@@ -172,9 +208,25 @@ static void write_frame(struct nodecap *nc, const uint8_t *au, size_t len, int64
 			off = len;
 		}
 	}
-	fwrite(au, 1, off, nc->out);
-	fwrite(sei, 1, sei_len, nc->out);
-	fwrite(au + off, 1, len - off, nc->out);
+	/* The frame with its SEI, without copying: head, SEI, rest. */
+	struct iovec iov[3] = { { (void *)au, off }, { sei, sei_len },
+				{ (void *)(au + off), len - off } };
+
+	if (nc->out)
+		for (int i = 0; i < 3; i++)
+			fwrite(iov[i].iov_base, 1, iov[i].iov_len, nc->out);
+	if (nc->rec_on) {
+		int r = rec_write_frame(&nc->rec, iov, 3, index, matched ? e->t_ns : nc->t0_ns + pts,
+					key);
+
+		if (r == 0)
+			nc->st.rec_frames++;
+		else if (r == 1)
+			nc->st.rec_skipped++;
+		else if (++nc->st.rec_errors <= 5)
+			fprintf(stderr, "nodecap: recording index %" PRId64 " failed: %s\n", index,
+				strerror(-r));
+	}
 	nc->st.bytes += len + sei_len;
 
 	if (nc->log)
@@ -369,6 +421,17 @@ static int start_session(struct nodecap *nc, const struct fwt_trig_msg *m)
 		"T0 %" PRId64 ", first index %" PRId64 "\n", nc->session, nc->period_ns,
 		nc_fps_of(nc->period_ns), nc->t0_ns, m->index);
 	nc->started = true;
+	if (nc->rec_on) {
+		g_mutex_lock(&nc->lock);
+		int r = rec_session_start(&nc->rec, nc->session, nc->t0_ns, nc->period_ns);
+		g_mutex_unlock(&nc->lock);
+
+		if (r) {
+			fprintf(stderr, "nodecap: recorder refused session %" PRIu32 ": %s\n",
+				nc->session, strerror(-r));
+			return -1;
+		}
+	}
 	return build_pipeline(nc);
 }
 
@@ -491,6 +554,72 @@ static int drain(struct nodecap *nc)
 	return -1;
 }
 
+/* Control socket for lock requests while recording (rec_ctl.h). */
+static int open_ctl(const char *path)
+{
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	char dir[sizeof(a.sun_path)];
+
+	if (strlen(path) >= sizeof(a.sun_path))
+		return -1;
+	strcpy(a.sun_path, path);
+	strcpy(dir, path);
+	char *slash = strrchr(dir, '/');
+
+	if (slash && slash != dir) {
+		*slash = 0;
+		mkdir(dir, 0755);  /* fine if it exists */
+	}
+	unlink(path);
+
+	int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+
+	if (fd < 0 || bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+		fprintf(stderr, "nodecap: control socket %s: %s\n", path, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static void handle_ctl(struct nodecap *nc)
+{
+	struct rec_ctl_msg m, rep;
+	struct sockaddr_un from;
+	socklen_t flen = sizeof(from);
+	ssize_t n = recvfrom(nc->ctl_fd, &m, sizeof(m), 0, (struct sockaddr *)&from, &flen);
+
+	if (n < 0 || !rec_ctl_valid(&m, n))
+		return;
+	rec_ctl_init(&rep, REC_CTL_REPLY);
+	m.text[sizeof(m.text) - 1] = 0;
+
+	g_mutex_lock(&nc->lock);
+	if (m.type == REC_CTL_LOCK) {
+		uint32_t session = m.session ? m.session : nc->session;
+
+		rep.result = rec_lock(&nc->rec, session, m.from_idx, m.to_idx, m.ttl_s, m.text,
+				      &rep.lock_id, rep.text, sizeof(rep.text));
+		if (rep.result == 0) {
+			nc->st.locks_ok++;
+			snprintf(rep.text, sizeof(rep.text), "locked");
+		} else {
+			nc->st.locks_refused++;
+		}
+		rep.session = session;
+	} else if (m.type == REC_CTL_UNLOCK) {
+		rep.result = rec_unlock(&nc->rec, m.lock_id);
+		rep.lock_id = m.lock_id;
+		snprintf(rep.text, sizeof(rep.text), "%s", rep.result ? "no such lock" : "unlocked");
+	} else {
+		rep.result = -EINVAL;
+		snprintf(rep.text, sizeof(rep.text), "unknown request");
+	}
+	g_mutex_unlock(&nc->lock);
+	sendto(nc->ctl_fd, &rep, sizeof(rep), MSG_DONTWAIT, (struct sockaddr *)&from, flen);
+}
+
 int main(int argc, char **argv)
 {
 	static struct nodecap nc;  /* large (edge table); zero-initialised */
@@ -511,10 +640,30 @@ int main(int argc, char **argv)
 	if (init_frames(&nc) != 0)
 		return 1;
 
-	nc.out = fopen(nc.o.out_path, "wb");
-	if (!nc.out) {
-		fprintf(stderr, "nodecap: %s: %s\n", nc.o.out_path, strerror(errno));
-		return 1;
+	nc.ctl_fd = -1;
+	if (nc.o.rec_dir) {
+		struct rec_config rc = { .dir = nc.o.rec_dir, .ring_max_bytes = nc.o.ring_max_mb << 20,
+					 .reserve_bytes = 64u << 20, .seg_seconds = nc.o.seg_seconds,
+					 .lock_cap_pct = nc.o.lock_cap_pct, .log = stderr,
+					 /* first segment's expected size: bitrate x length */
+					 .min_seg_bytes = (uint64_t)nc.o.bitrate / 8 *
+							  (uint64_t)nc.o.seg_seconds };
+		int r = rec_open(&nc.rec, &rc);
+
+		if (r) {
+			fprintf(stderr, "nodecap: recorder %s: %s%s\n", nc.o.rec_dir, strerror(-r),
+				r == -EBUSY ? " (another recorder owns it)" : "");
+			return 1;
+		}
+		nc.rec_on = true;
+		nc.ctl_fd = open_ctl(nc.o.ctl_path);  /* locks unavailable if this fails */
+	}
+	if (nc.o.out_path) {
+		nc.out = fopen(nc.o.out_path, "wb");
+		if (!nc.out) {
+			fprintf(stderr, "nodecap: %s: %s\n", nc.o.out_path, strerror(errno));
+			return 1;
+		}
 	}
 	if (nc.o.log_path) {
 		nc.log = fopen(nc.o.log_path, "w");
@@ -535,13 +684,18 @@ int main(int argc, char **argv)
 	int64_t last_index = -1;
 
 	while (!g_stop && !ended && !failed && (!nc.o.count || (int64_t)nc.st.edges < nc.o.count)) {
-		struct pollfd p = { .fd = fd, .events = POLLIN };
+		struct pollfd p[2] = { { .fd = fd, .events = POLLIN },
+				       { .fd = nc.ctl_fd, .events = POLLIN } };
 
 		if (nc.pipe && poll_bus(&nc, 0) != 0) {
 			failed = true;
 			break;
 		}
-		if (poll(&p, 1, 100) <= 0)
+		if (poll(p, 2, 100) <= 0)
+			continue;
+		if (p[1].revents & POLLIN)
+			handle_ctl(&nc);
+		if (!(p[0].revents & POLLIN))
 			continue;
 
 		struct fwt_trig_msg m;
@@ -583,6 +737,19 @@ int main(int argc, char **argv)
 
 	struct stats *s = &nc.st;
 
+	if (nc.rec_on) {
+		rec_close(&nc.rec);  /* closes the open segment, ends the session */
+		printf("recorder: recorded %" PRIu64 ", skipped %" PRIu64 ", errors %" PRIu64
+		       ", segments closed %" PRIu64 ", deleted %" PRIu64 ", locks %" PRIu64
+		       " (refused %" PRIu64 ")\n", s->rec_frames, s->rec_skipped, s->rec_errors,
+		       nc.rec.st.segments_closed, nc.rec.st.segments_deleted, s->locks_ok,
+		       s->locks_refused);
+		if (nc.ctl_fd >= 0) {
+			close(nc.ctl_fd);
+			unlink(nc.o.ctl_path);
+		}
+	}
+
 	printf("summary: session %" PRIu32 ", edges %" PRIu64 ", pushed %" PRIu64
 	       ", dropped %" PRIu64 ", frames %" PRIu64 ", keyframes %" PRIu64
 	       ", gaps %" PRId64 " (missing %" PRId64 "), duplicates %" PRId64
@@ -590,13 +757,15 @@ int main(int argc, char **argv)
 	       ", bytes %" PRIu64 ", sei %s%s\n",
 	       nc.session, s->edges, s->pushed, s->dropped_in, s->frames_out, s->keyframes,
 	       nc.chk.gaps, nc.chk.missing, nc.chk.dups, nc.chk.backward, s->unmatched,
-	       s->no_vcl, s->bytes, nc.o.no_sei ? "off" : "on", failed ? " [pipeline error]" : "");
+	       s->no_vcl, s->bytes, nc.o.no_sei ? "off" : "on", failed ? " [failed]" : "");
 
 	bool ok = !failed && s->frames_out == s->edges && !s->dropped_in && !nc.chk.gaps &&
-		  !nc.chk.dups && !nc.chk.backward && !s->unmatched && !s->no_vcl;
+		  !nc.chk.dups && !nc.chk.backward && !s->unmatched && !s->no_vcl &&
+		  (!nc.rec_on || (s->rec_frames == s->frames_out && !s->rec_errors));
 	g_mutex_unlock(&nc.lock);
 
-	fclose(nc.out);
+	if (nc.out)
+		fclose(nc.out);
 	if (nc.log)
 		fclose(nc.log);
 	return ok ? 0 : 1;
