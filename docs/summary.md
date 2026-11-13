@@ -28,6 +28,7 @@ One PTP time base on every node -> one plan `{session, T0, P}` to all nodes -> e
 | **PTP lock check** | every edge is flagged "time not verified" (DL-13) | the flag is honest; the check (ask `ptp4l`) is designed, not built |
 | **Recovery under unplug / power pull** (M10) | not run | process kill and recorder crash recovery are tested; unplug and power pull are not |
 | **Events, configure endpoint, conformance suite** | designed, not built | ICD v1 covers arm, disarm, health, sessions, segments, fetch, lock |
+| **Security** (G5) | the bench is open: root SSH without a password, control interface without authentication, recordings unencrypted, bundles unsigned, debug ports open | bench / closed lab network only; a security track is planned (threat model first) |
 
 ## 4. What I skipped, and why
 
@@ -67,4 +68,4 @@ From architecture §11.2; each step unblocks the next.
 5. **Product platform:** Yocto, A/B updates, secure boot, identity, interface security.
 6. **Lite tier:** RV1106 + supervisor MCU as edge source; time base chosen by the sync budget.
 
-Alongside: a richer camera emulator and a CI / hardware-in-the-loop rig.
+Alongside: a **security track** (threat model first; authentication and network hardening with several nodes; secure boot, signed updates, identity and encrypted recordings with the product platform), a richer camera emulator and a CI / hardware-in-the-loop rig.
