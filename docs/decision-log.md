@@ -25,6 +25,10 @@ All dates 2026-11-12.
 | DL-15 | Frame timestamp (PTS) = edge time - T0 |
 | DL-16 | SEI insertion: our own C code now, GStreamer element later |
 | DL-17 | Frame index drawn into test frames |
+| DL-18 | Segment cut: first keyframe at or after the boundary |
+| DL-19 | Manifest: fixed 128-byte records with checksum |
+| DL-20 | Session number: made by the single plan maker, never by a node |
+| DL-21 | Recorder v1: full scope |
 
 ---
 
@@ -153,3 +157,28 @@ All dates 2026-11-12.
 - **Why:** proves each SEI sits on the right frame. A continuity check alone misses an off-by-one shift (every frame carrying its neighbour's SEI is still continuous).
 - **Limit:** test source only; with a camera the equivalent is a visible counter or LED in the scene.
 - **Cost:** ~50 lines each side; large high-contrast squares survive compression.
+
+## DL-18 Segment cut: first keyframe at or after the boundary
+
+- **Decision:** a segment ends at the first keyframe at or after its boundary index (multiple of 4 s worth of frames, 120 @30 fps); the next file is named by its real first index.
+- **Why:** the encoder counts frames, not trigger indices; after a dropped frame the boundary index may not be a keyframe. Cutting only at keyframes keeps every segment decodable on its own. Segments are 4 s, up to +1 s after a drop.
+- **Alternative:** force a keyframe at each boundary index: exact boundaries, relies on the encoder honouring the request.
+
+## DL-19 Manifest: fixed 128-byte records with checksum
+
+- **Decision:** every manifest record (session start/end, segment closed, segment deleted, lock, unlock) is 128 bytes: header (magic, version, type, sequence number, session), type-specific fields, CRC-32 at the end.
+- **Why:** simple to write, read and seek; a record half-written at power loss fails its CRC and is dropped (and cut off) at the next start; room for 8 keyframe positions per segment (4 s at 0.5-1 s keyframe interval).
+- **Alternative:** variable-length records: smaller, more parsing code and harder torn-write detection.
+
+## DL-20 Session number: made by the single plan maker, never by a node
+
+- **Decision:** the session number is part of the session plan {session, T0, period} and comes from the one place that makes the plan: the controller in the product, the laptop (test script or operator) in the trial. Every node of a pack gets the same number. `trigd` requires `--session` (no default); the recorder refuses a number already on disk.
+- **Why:** (session, index) must mean the same instant on every node; a number made per node (or a default like 1) breaks that or silently mixes two runs in one directory.
+- **Alternatives:** random number per node (breaks cross-node identity); number from T0 (the board's PTP clock restarts at 0 each boot when unsynchronised, so numbers repeat); counter stored per node (nodes disagree).
+- **Later (controller):** random numbers need no stored state on a microcontroller; widen from 32 to 64 bits if sessions become very many (message and SEI version bump). The recorder's refusal stays as the safety net.
+
+## DL-21 Recorder v1: full scope
+
+- **Decision:** v1 = segments, manifest, ring, locks (incl. post-event window and lock cap), recovery after crash or power loss, `rec-tool` (list, verify, lock). Fetch over the network comes with the control interface (`nodeagent`).
+- **Why:** the brief's storage questions (ring, locks, crash behaviour) are answered only by the full set; fetch needs the control interface anyway.
+
