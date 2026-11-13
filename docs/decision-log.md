@@ -227,7 +227,12 @@ All dates 2026-11-12.
 
 ## DL-27 Frame-to-edge binding by time, shared by all camera sources
 
-- **Decision:** for external frame sources (emulator, camera) `nodecap` converts edge times from PTP to monotonic time and binds a frame to the edge whose time + expected latency is closest, within ± half a period (architecture §4.4). No edge in the window -> spurious frame, flagged, no invented index; edge without a frame -> gap; sequence jumps cross-checked with gaps. Expected latency configured (`--cam-latency-ms`, default 25 ms) with a warning when frames sit far from it.
-- **Why:** the index must come from the trigger, never from counting frames; the same logic then serves the emulator now and the camera later.
-- **Later:** latency measured automatically at session start; the sensor's own frame counter as a third check.
-
+- **Decision:** for external frame sources (emulator, camera) `nodecap` converts edge times from PTP to monotonic time and binds a frame to the edge whose time + expected latency is closest, within a window. No edge in the window -> spurious frame, not encoded, no invented index; two frames for one edge -> the closer one kept; edge without a frame -> gap; sequence jumps counted next to gaps. Expected latency configured (`--cam-latency-ms`, default 25 ms).
+- **Window:** `--cam-window-ms`, default 3 ms; refused at a quarter period or more; warning when a bound frame lies beyond half the window (window too tight for this camera). Rule: several times the measured spread of frame timestamps, and below a quarter period.
+- **Why:** the index must come from the trigger, never from counting frames; the same logic serves the emulator now and the camera later.
+- **Why not half a period (first version):** a frame late by 3/4 period lands 1/4 period from the next edge; if that edge's own frame is missing, the late frame takes its index. Seen in the emulator stress run (60 fps, 3 % drop/extra/late): 1 frame with a wrong index at +-8.3 ms and at +-5 ms, none at +-3 ms. Below a quarter period minus jitter, every fault the emulator makes is rejected, so the emulator check is strict: any wrong index is a bug.
+- **Limit:** timing alone can't be fully safe. A frame landing where a missing frame would have been (sensor glitch, a strongly delayed frame) is indistinguishable by time; the sequence counter doesn't show it either (one lost + one extra cancel out). A smaller window only makes it rarer.
+- **Later:**
+  - Before a real camera is trusted: the sensor's own frame counter (AR0234 embedded data lines) as a second, independent signal, so each frame carries which trigger made it; timing becomes the cross-check.
+  - Real camera bring-up: measure the timestamp spread (fixed exposure, under load), then set the window.
+  - Latency measured and tracked automatically (it moves with exposure time if the timestamp marks the end of the frame).
