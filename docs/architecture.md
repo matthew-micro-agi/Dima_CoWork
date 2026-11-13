@@ -183,7 +183,7 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 | `nodeagent` | C | control interface (§6) on `libmicrohttpd`, segment fetch. **v1 done:** the only long-running process; starts `trigd` + `nodecap` per session (DL-23) |
 | `ptp4l`, `phc2sys` | linuxptp | time |
 
-- Each runs as a systemd service with restart. Health goes over a local socket to `nodeagent`.
+- **As built:** `nodeagent` runs as the systemd service `fwtrial-nodeagent` and starts `trigd` + `nodecap` per session (DL-23); `ptp4l` as `fwtrial-ptp4l` (DL-25). Product: each as its own service with restart (DL-12, DL-14); health over a local socket to `nodeagent`.
 - `nodecap` and `recorder` share one process so encoded frames reach the recorder without inter-process transfer. The recorder stays a separate module (plain functions), ready to become the `segmentsink` element.
 
 - **Language: C** for all on-node code (why: decision log DL-02). Libraries: `libmicrohttpd` 12.62.1 (in the SDK sysroot and on the board image); zcbor vendored (§6).
@@ -360,10 +360,11 @@ Another node may use entirely different code for camera, ISP, encode and timing.
 ## 9. Build and deploy
 
 - **Image:** Yocto scarthgap, TI config `processor-sdk-analytics-11.02.02` + our layer `meta-fwtrial` (services, configs, overlay, driver), pinned with kas.
-- **Now (bench):** cross-compile with the installed SDK via the CMake toolchain file and copy to `/tmp` on the board running the 11.0 image (user space compatible, §1.2). Commands and check scripts: `docs/setup.md` §8.
+- **Now (bench), as built (DL-24):** `deploy/deploy.sh <user@node>`: cross-build with the installed SDK (CMake toolchain file), bundle `fwtrial-<version>-aarch64.tar.gz`, install on the board running the 11.0 image (user space compatible, §1.2) into `/opt/fwtrial/releases/<version>` with an atomic `current` symlink, previous release kept for `install.sh --rollback`, systemd units enabled at boot. Version = project version + git commit. Verified: deploy, session through the installed service, reboot (services back by themselves). Commands: `docs/setup.md` §8.6. Check scripts copy their own build to `/tmp` and pause the installed service during a run.
+- **Services (as built):** `fwtrial-nodeagent` (the only long-running process of ours, DL-23; `trigd --disarm-only` before start and after every stop, DL-14; waits for `/rec`; restart on failure) and `fwtrial-ptp4l` (PTP client only, DL-25).
 - **Build system: CMake** (DL-05): laptop build for unit tests, board cross-build via `cmake/j722s-sdk.cmake` (SDK compiler + sysroot); zcbor code regenerated from the `.cddl`; `ctest`; Yocto `cmake` class later.
 - **Kernel work** (overlay, driver) needs the matching kernel: install the SDK 6.12.57 kernel + modules + DTBs, or flash a fresh 11.02 image to a spare SD.
-- **Update/rollback:** A/B rootfs on eMMC (§5.7), boot counting in U-Boot (e.g. RAUC). **TBD**.
+- **Update/rollback (product):** A/B rootfs on eMMC (§5.7), boot counting in U-Boot (e.g. RAUC). **TBD**. The trial's release directories + symlink are the same idea for our software only.
 - **Secure boot/identity:** board is HS-FS; product uses HS-SE with our keys; per-device key in OP-TEE / eMMC RPMB. **TBD**.
 
 ---
@@ -418,7 +419,7 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 | A8 | Matching + drop detection | no | **encoder-output check done**; camera-side matching with B |
 | A9 | Node simulator + conformance tests | no | open |
 | A10 | Soak and fault tests | no | open; check scripts exist (`tests/*-check.sh`) |
-| A11 | PTP with the laptop | no | bench check done (P-3); gPTP config open |
+| A11 | PTP with the laptop | no | bench check done (P-3); runs at boot as `fwtrial-ptp4l` (client only); gPTP profile and lock check (DL-13) open |
 | B1-B5 | Sensor driver, overlay, ISP path, real binding, strobe measurement | yes | blocked (G3) |
 
 - **Order:** A2 -> A1 + A3 + A4 -> A5 + A6 -> A7, A8 -> A10 -> A9 / A11.

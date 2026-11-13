@@ -395,7 +395,84 @@ Then adapt `src/nodeagent/main.c` to new or changed struct fields (the compiler 
 - A message type name must not equal one of its own keys (`sessions = { "sessions" => ... }` fails: duplicate function name); hence `sessions-rep`.
 - Additive changes only within ICD version 1 (new optional fields, new messages); anything else is a new `icd/fwt-icd-v2.cddl`.
 
-Not yet: install paths, systemd units (DL-14), Yocto layer.
+### 8.6 Deploy to the node (installed service, starts at boot)
+
+From a checkout to a running node with **one command** (DL-24). It needs the TI SDK (§2.2), the laptop venv (§2.4, for the version check), `/rec` on the node (§6) and SSH as root (§3).
+```sh
+cd ~/Dima_CoWork && \
+deploy/deploy.sh root@10.42.0.132
+```
+It runs `deploy/make-bundle.sh` (cross-build + tarball), copies the tarball to the node, runs `install.sh` there, then checks from the laptop that `GET /v1/identity` reports the new version.
+
+**Expected end:**
+```
+  fwtrial-ptp4l.service: active
+  fwtrial-nodeagent.service: active
+installed 0.1.0-g<commit> (rollback: sh /opt/fwtrial/current/install.sh --rollback)
+{"icd": 1, "node": "j722s-evm", "version": "0.1.0-g<commit>", ...}
+DEPLOYED 0.1.0-g<commit> to root@10.42.0.132 ...
+```
+- **Version:** project version + git commit; `-dirty` if the checkout has uncommitted changes (`make-bundle.sh` warns). Deploy committed code.
+- **Bundle only** (offline, hand to someone else): `deploy/make-bundle.sh` -> `dist/fwtrial-<version>-aarch64.tar.gz` (~400 KB). Install by hand on the node:
+  ```sh
+  scp dist/fwtrial-<version>-aarch64.tar.gz root@10.42.0.132:/tmp/ && \
+  ssh root@10.42.0.132 \
+    'cd /tmp && tar xzf fwtrial-<version>-aarch64.tar.gz && \
+     sh fwtrial-<version>/install.sh'
+  ```
+
+**What lands where on the node:**
+
+| Path | What |
+|---|---|
+| `/opt/fwtrial/releases/<version>/` | `bin/` (trigd, nodecap, nodeagent, rec-tool, trig-listen, fwt-info), `systemd/`, `etc/` (defaults), `install.sh`, `VERSION` |
+| `/opt/fwtrial/current` | symlink to the running release (switched atomically) |
+| `/opt/fwtrial/previous` | version to roll back to |
+| `/etc/fwtrial/nodeagent.conf`, `ptp4l.conf` | configs: written only if missing (local edits survive updates); the new defaults sit next to them as `*.default` |
+| `/etc/systemd/system/fwtrial-nodeagent.service` | control interface, port 8080; starts `trigd` + `nodecap` per session; `trigd --disarm-only` before start and after every stop (DL-14); waits for `/rec` |
+| `/etc/systemd/system/fwtrial-ptp4l.service` | PTP client on `eth0`, client only (DL-25) |
+| `/var/log/fwtrial/` | `trigd.log`, `nodecap.log` of the last session |
+| `/run/fwtrial/` | sockets (recreated at start) |
+
+Never touched: `/rec` (recordings), the image's own `ptp4l@.service` and `/etc/linuxptp/`. The newest 3 releases are kept.
+
+**Status, logs, restart** (on the node):
+```sh
+sh /opt/fwtrial/current/install.sh --status
+journalctl -u fwtrial-nodeagent -b --no-pager | tail -20
+journalctl -u fwtrial-ptp4l -b --no-pager | tail -5
+tail /var/log/fwtrial/nodecap.log
+systemctl restart fwtrial-nodeagent
+```
+
+**Change a setting** (port, ring size, encoder options; keys documented in the file):
+```sh
+ssh root@10.42.0.132 \
+  'vi /etc/fwtrial/nodeagent.conf && systemctl restart fwtrial-nodeagent'
+```
+
+**Roll back** to the previous release (and back again: run it twice):
+```sh
+ssh root@10.42.0.132 'sh /opt/fwtrial/current/install.sh --rollback'
+```
+
+**Check after a reboot** (verified: both services back without any action, ~25 s after the reboot command):
+```sh
+ssh root@10.42.0.132 \
+  'uptime; findmnt /rec; sh /opt/fwtrial/current/install.sh --status'
+```
+
+**Check scripts and the installed service:** board runs (`tests/*-check.sh dev`) pause `fwtrial-nodeagent` for the run (same port, sockets, `/rec`) and start it again at the end, also on failure.
+
+**Remove completely** (recordings in `/rec` stay):
+```sh
+ssh root@10.42.0.132 \
+  'systemctl disable --now fwtrial-nodeagent fwtrial-ptp4l; \
+   rm -f /etc/systemd/system/fwtrial-*.service; systemctl daemon-reload; \
+   rm -rf /opt/fwtrial /etc/fwtrial /var/log/fwtrial'
+```
+
+Not yet: Yocto layer (`meta-fwtrial`), signed bundles.
 
 ---
 
