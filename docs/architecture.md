@@ -19,7 +19,26 @@ Why each choice was made, the alternatives and dead ends: `decision-log.md` (DL-
 
 ## 1. Summary
 
-**TBD.** Write last: what runs, what was measured, what is stubbed.
+**The backbone: one PTP time base, one plan, edges in hardware.** Everything else hangs off this chain:
+```
+one PTP time base on every node (gPTP, DL-01)
+  -> one plan {session, T0, P} from the controller to all nodes
+  -> each node's CPTS fires edge k at T0 + k·P in hardware and captures its time (G1)
+  -> the edge triggers the sensor's exposure (hardware trigger, no software in the path)
+  -> nodecap binds the frame to its edge by time (§4.4)
+  -> every frame carries SEI {session, k, t_edge} (DL-16)
+  => same (session, k) on any node = the same instant; t_edge proves it
+```
+- **Measured (one node):** PTP offset to the bench grandmaster 41-52 ns RMS; every edge generated and captured by the CPTS, interval = period within the 2 ns resolution, constant +14 ns from the plan (§4.1, M4, M5).
+- **Described, not shown:** several nodes on one grid and sensors exposing together (§10.2, needs a second board / cameras + logic analyzer); sync error budget in §4.3.
+- **Assumption, to verify with the real camera:** the V4L2 frame timestamp is only used to pick the edge, so it may be imprecise by up to the ±3 ms window; its latency is assumed stable and its jitter well under 1.5 ms (half the window).
+  - **Where it is set (TI SDK driver `j721e-csi2rx.c`):** `ktime_get_ns()` (CLOCK_MONOTONIC) in the DMA completion callback, i.e. **after the whole frame is in RAM** (end of frame), run from a tasklet (softirq) after the DMA interrupt. The sequence number is a software counter of completed buffers (the driver's TODO: take the CSI-2 hardware frame number).
+  - **Latency** = exposure + readout + CSI-2/DMA + interrupt/tasklet: moves with exposure time (auto-exposure!), so fix the exposure or track the latency (DL-27 Later).
+  - **Jitter** = interrupt + softirq latency: typically tens of µs; under heavy load softirqs can be deferred (ksoftirqd), possibly to ms on this non-RT kernel.
+  - **Measure on the camera:** spread under load with fixed exposure; then set window and latency (DL-27). Sensor frame counter as the independent check.
+- **Without PTP hardware (lite tier):** the chain stays, only the time base and the edge maker change: the supervisor MCU makes the edge, disciplined by a wired pack trigger, PPS, software PTP or radio (DL-01 "Lite tier", §8.1); the choice follows the sync budget (§11.4).
+
+Rest of the summary (what runs, what was measured, what is stubbed): written last.
 
 ### 1.1 Time and data model: answers to the brief
 
@@ -364,7 +383,8 @@ Another node may use entirely different code for camera, ISP, encode and timing.
 | Overlay / pinmux | rewrite [EVM] | rewrite | rewrite |
 | ISP path (TIOVX) | reuse | reuse (smaller VPAC) | replace (RKAIQ) |
 | Encoder element | reuse | reuse (same Wave5) | replace (Rockchip MPP) |
-| Trigger (CPTS, `trigd`) | reuse, new pins | reuse | moves to the supervisor MCU |
+| Time base | PTP, CPTS hardware timestamps | same | supervisor MCU timer, disciplined by a wired pack trigger, PPS, software PTP or radio (DL-01 "Lite tier"); RV1106 hardware PTP timestamps to check |
+| Trigger (CPTS, `trigd`) | reuse, new pins | reuse | moves to the supervisor MCU: it makes the edge and sends `{k, t}` to the SoC (another `trigd` edge source; matching, SEI, recorder unchanged) |
 | recorder, manifest, nodeagent, SEI, matching | reuse | reuse | reuse (performance check on a single A7) |
 | Build (Yocto layer) | new machine | new machine | different BSP |
 

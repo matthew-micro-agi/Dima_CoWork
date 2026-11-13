@@ -56,6 +56,13 @@ All dates 2026-11-12.
 - **At ~100 nodes:** time-aware switches in every hop; one gPTP configuration in the image (bench check used linuxptp defaults); a real grandmaster with failover and holdover; PTP state and offset in node health; qualify each NIC/driver (the laptop's Intel I219 clock ran ~1600 ppm off and needs `phc2sys`); calibrate absolute accuracy once per hardware type (PTP can't see asymmetric delays).
 - **Later, security:** closed network + switch port roles + nodes slave-only as baseline; PTP authentication or MACsec if needed (check Zephyr/switch support); NTS for the grandmaster's UTC; alarms on path-delay jumps (delay attacks: detectable, not preventable).
 - **Later, low power:** Single Pair Ethernet (10BASE-T1L) for sync/control links; Energy-Efficient Ethernet off on PTP links; TCXO for holdover. Sync cost is negligible next to a recording node (~1-2 W, estimate).
+- **Lite tier (no PTP hardware assumed):** the chain stays (shared time base -> one plan -> edge k at T0 + k·P -> frames carry k, t); only the time base and the edge maker change. The supervisor MCU makes the edge on its timer and sends `{k, t}` to the SoC like `trigd` does (another edge source; matching, SEI, recorder unchanged). Options for the MCU's time base:
+  - wired trigger line inside a pack: ns, one wire per pack (also the standard tier's pack design);
+  - PPS + time of day from the controller on a wire: ~1 µs;
+  - PTP with software timestamps on the SoC (`ptp4l -S`): ~10-100 µs, worse under load;
+  - radio sync from the MCU (Nordic proprietary, 802.15.4, BLE timing): ~µs, unproven; UWB: ~ns, unproven; cable-free installs only;
+  - NTP/chrony: µs with hardware timestamps, 100 µs+ without (fallback).
+  - **Decided by the sync budget** (architecture §11.4, TBD). **Check first:** whether the RV1106 Ethernet MAC timestamps PTP in hardware (then plain PTP fits the lite tier too).
 
 ## DL-02 Code on the node: C
 
