@@ -8,3 +8,6 @@ build*/
 
 # Node bundles (deploy/make-bundle.sh)
 dist/
+
+# Editor tag index (ctags)
+tags
