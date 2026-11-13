@@ -23,6 +23,7 @@
  * recording; the session number comes from trigd's plan (DL-20).
  */
 #include <errno.h>
+#include <pthread.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <poll.h>
@@ -47,11 +48,13 @@
 #include "fwt_trig_msg.h"
 #include "nc_match.h"
 #include "nc_source.h"
+#include "nc_wq.h"
 #include "nodecap_core.h"
 #include "rec_ctl.h"
 #include "recorder.h"
 
-#define SRC_MAX_QUEUED 4  /* frames waiting in appsrc before we drop */
+#define SRC_MAX_QUEUED 8  /* frames waiting for the encoder before we drop: 133 ms at 60 fps
+                           * (Wave5 takes > 4 frames to start: one drop at 60 fps) */
 
 struct opts {
 	const char *sock_path, *enc, *out_path, *log_path, *enc_extra, *level;
@@ -60,6 +63,7 @@ struct opts {
 	int cam_bufs;
 	int64_t cam_latency_ns, cam_window_ns;
 	uint64_t ring_max_mb;
+	unsigned write_queue_mb;
 	int seg_seconds, lock_cap_pct;
 	int w, h;
 	unsigned bitrate;  /* bit/s */
@@ -71,9 +75,13 @@ struct stats {
 	uint64_t edges, pushed, dropped_in, frames_out, unmatched, keyframes, no_vcl;
 	uint64_t bytes;
 	uint64_t rec_frames, rec_skipped, rec_errors, locks_ok, locks_refused;
+	uint64_t out_errors;  /* --out file writes that failed */
 	/* camera sources (emu) */
 	uint64_t cam_frames, cam_before_start, seq_jumps, seq_skipped;
 	uint64_t cam_wide;  /* bound frames beyond half the window */
+	/* shared lock: longest hold by the encoder-output thread (incl. recorder
+	 * I/O), longest wait of the capture loop for it */
+	int64_t lock_hold_max_ns, lock_wait_max_ns;
 };
 
 struct nodecap {
@@ -101,6 +109,13 @@ struct nodecap {
 	struct stats st;
 	FILE *out, *log;
 	struct recorder rec;
+	/* storage: frames go through the write queue to the writer thread, which
+	 * owns all file I/O (recorder, --out); rec_lock guards the recorder
+	 * (writer thread, lock requests), never held by capture or encoding */
+	struct nc_wq wq;
+	pthread_t writer;
+	bool writer_on;
+	GMutex rec_lock;
 	bool rec_on;
 	int ctl_fd;
 };
@@ -137,6 +152,8 @@ static void usage(const char *prog)
 		"  --seg-seconds N    segment length (default 4)\n"
 		"  --lock-cap-pct N   max share of the ring that may be locked (default 20)\n"
 		"  --ctl-sock PATH    lock requests while recording (default %s)\n"
+		"  --write-queue-mb N frames waiting for storage, MB (default 16: ~13 s at\n"
+		"                     10 Mbps; storage syncs take up to ~0.7 s on the eMMC)\n"
 		"  --out FILE         also/instead write one H.265 byte stream\n"
 		"  --log FILE         per-frame CSV log\n"
 		"  --count N          stop after N edges\n"
@@ -168,6 +185,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		{ "seg-seconds", required_argument, NULL, 'G' },
 		{ "lock-cap-pct", required_argument, NULL, 'C' },
 		{ "ctl-sock", required_argument, NULL, 'K' },
+		{ "write-queue-mb", required_argument, NULL, 'Q' },
 		{ "log", required_argument, NULL, 'l' },
 		{ "count", required_argument, NULL, 'n' },
 		{ "no-sei", no_argument, NULL, 's' },
@@ -183,7 +201,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 			    .cam_sock = FWT_CAMEMU_SOCK_DEFAULT, .cam_bufs = 4,
 			    .cam_latency_ns = 25000000, .cam_window_ns = 3000000,
 			    .enc_extra = "", .level = "5", .ctl_path = REC_CTL_SOCK_DEFAULT,
-			    .src_name = "test",
+			    .src_name = "test", .write_queue_mb = 16,
 			    .seg_seconds = 4, .lock_cap_pct = 20,
 			    .w = 1920, .h = 1200, .bitrate = 5000000 };
 	while ((c = getopt_long(argc, argv, "qh", lo, NULL)) != -1) {
@@ -215,6 +233,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		case 'G': o->seg_seconds = atoi(optarg); break;
 		case 'C': o->lock_cap_pct = atoi(optarg); break;
 		case 'K': o->ctl_path = optarg; break;
+		case 'Q': o->write_queue_mb = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'l': o->log_path = optarg; break;
 		case 'n': o->count = strtoll(optarg, NULL, 0); break;
 		case 's': o->no_sei = true; break;
@@ -276,21 +295,13 @@ static void write_frame(struct nodecap *nc, const uint8_t *au, size_t len, int64
 	struct iovec iov[3] = { { (void *)au, off }, { sei, sei_len },
 				{ (void *)(au + off), len - off } };
 
-	if (nc->out)
-		for (int i = 0; i < 3; i++)
-			fwrite(iov[i].iov_base, 1, iov[i].iov_len, nc->out);
-	if (nc->rec_on) {
-		int r = rec_write_frame(&nc->rec, iov, 3, index, matched ? e->t_ns : nc->t0_ns + pts,
-					key);
-
-		if (r == 0)
-			nc->st.rec_frames++;
-		else if (r == 1)
-			nc->st.rec_skipped++;
-		else if (++nc->st.rec_errors <= 5)
-			fprintf(stderr, "nodecap: recording index %" PRId64 " failed: %s\n", index,
-				strerror(-r));
-	}
+	/* To the writer thread (copy; never waits for storage). Full queue: the
+	 * frame is not stored, counted as an overflow and seen as a gap. */
+	if (nc->writer_on && !nc_wq_push(&nc->wq, iov, 3, index,
+					 matched ? e->t_ns : nc->t0_ns + pts, key) &&
+	    nc->wq.overflow <= 5)
+		fprintf(stderr, "nodecap: write queue full (storage stalled): index %" PRId64
+			" not stored\n", index);
 	nc->st.bytes += len + sei_len;
 
 	if (nc->log)
@@ -330,6 +341,8 @@ static GstFlowReturn on_sample(GstAppSink *sink, gpointer user)
 	struct nc_edge e = { 0 };
 
 	g_mutex_lock(&nc->lock);
+	int64_t held_from = fwt_mono_now_ns();
+
 	nc_index_of_pts(pts, nc->period_ns, &index);
 
 	bool matched = nc_table_take(&nc->table, index, &e);
@@ -351,11 +364,45 @@ static GstFlowReturn on_sample(GstAppSink *sink, gpointer user)
 	if (!nc->o.quiet)
 		printf("frame index %" PRId64 " pts %" PRId64 " bytes %zu%s\n", index, pts,
 		       map.size, key ? " key" : "");
+	int64_t held = fwt_mono_now_ns() - held_from;
+
+	if (held > nc->st.lock_hold_max_ns)
+		nc->st.lock_hold_max_ns = held;
 	g_mutex_unlock(&nc->lock);
 
 	gst_buffer_unmap(buf, &map);
 	gst_sample_unref(sample);
 	return GST_FLOW_OK;
+}
+
+/* ---- storage: writer thread ------------------------------------------- */
+
+static void *writer_main(void *user)
+{
+	struct nodecap *nc = user;
+	struct nc_wq_item *it;
+
+	while ((it = nc_wq_pop(&nc->wq))) {
+		struct iovec v = { it->data, it->len };
+
+		if (nc->out && fwrite(it->data, 1, it->len, nc->out) != it->len)
+			nc->st.out_errors++;
+		if (nc->rec_on) {
+			g_mutex_lock(&nc->rec_lock);
+			int r = rec_write_frame(&nc->rec, &v, 1, it->index, it->t_ns, it->key);
+
+			if (r == 0)
+				nc->st.rec_frames++;
+			else if (r == 1)
+				nc->st.rec_skipped++;
+			else if (++nc->st.rec_errors <= 5)
+				fprintf(stderr, "nodecap: recording index %" PRId64 " failed: %s\n",
+					it->index, strerror(-r));
+			g_mutex_unlock(&nc->rec_lock);
+		}
+		free(it);
+	}
+	return NULL;
 }
 
 /* ---- pipeline --------------------------------------------------------- */
@@ -503,9 +550,9 @@ static int start_session(struct nodecap *nc, const struct fwt_trig_msg *m)
 			nc->o.cam_latency_ns / 1e6, nc_match_window(&nc->match) / 1e6);
 	}
 	if (nc->rec_on) {
-		g_mutex_lock(&nc->lock);
+		g_mutex_lock(&nc->rec_lock);
 		int r = rec_session_start(&nc->rec, nc->session, nc->t0_ns, nc->period_ns);
-		g_mutex_unlock(&nc->lock);
+		g_mutex_unlock(&nc->rec_lock);
 
 		if (r) {
 			fprintf(stderr, "nodecap: recorder refused session %" PRIu32 ": %s\n",
@@ -513,7 +560,11 @@ static int start_session(struct nodecap *nc, const struct fwt_trig_msg *m)
 			return -1;
 		}
 	}
-	return build_pipeline(nc);
+	int64_t t_build = fwt_mono_now_ns();
+	int r = build_pipeline(nc);
+
+	fprintf(stderr, "nodecap: pipeline started in %.0f ms\n", (fwt_mono_now_ns() - t_build) / 1e6);
+	return r;
 }
 
 /* Copy a source frame into an encoder buffer (drawing the index for the test
@@ -552,7 +603,13 @@ static void push_buffer(struct nodecap *nc, GstBuffer *buf, const struct nc_edge
 	GST_BUFFER_PTS(buf) = (GstClockTime)nc_pts_of(e->t_ns, nc->t0_ns);
 	GST_BUFFER_DURATION(buf) = (GstClockTime)nc->period_ns;
 
+	int64_t wait_from = fwt_mono_now_ns();
+
 	g_mutex_lock(&nc->lock);
+	int64_t waited = fwt_mono_now_ns() - wait_from;
+
+	if (waited > nc->st.lock_wait_max_ns)
+		nc->st.lock_wait_max_ns = waited;
 	nc_table_put(&nc->table, e);
 	g_mutex_unlock(&nc->lock);
 
@@ -696,10 +753,15 @@ static void on_edge(struct nodecap *nc, const struct fwt_trig_msg *m)
 		struct nc_medge e = { .index = m->index, .t_ns = m->t_ns, .t_mono_ns = m->t_ns - off,
 				      .session = m->session, .flags = m->flags };
 
-		push_decided(nc, fwt_mono_now_ns());
-		if (!nc_match_edge(&nc->match, &e))
-			fprintf(stderr, "nodecap: too many undecided edges, edge %" PRId64
-				" not bound\n", m->index);
+		if (!nc_match_edge(&nc->match, &e)) {
+			/* list full (a stall of > 1 s): take the waiting frames, decide, retry */
+			if (!nc->cam_gone)
+				drain_source(nc);
+			push_decided(nc, fwt_mono_now_ns());
+			if (!nc_match_edge(&nc->match, &e))
+				fprintf(stderr, "nodecap: too many undecided edges, edge %" PRId64
+					" not bound\n", m->index);
+		}
 		return;
 	}
 	nc->cam->ops->on_edge(nc->cam, m);
@@ -836,7 +898,7 @@ static void handle_ctl(struct nodecap *nc)
 	rec_ctl_init(&rep, REC_CTL_REPLY);
 	m.text[sizeof(m.text) - 1] = 0;
 
-	g_mutex_lock(&nc->lock);
+	g_mutex_lock(&nc->rec_lock);  /* may wait for one storage sync */
 	if (m.type == REC_CTL_LOCK) {
 		uint32_t session = m.session ? m.session : nc->session;
 
@@ -857,7 +919,7 @@ static void handle_ctl(struct nodecap *nc)
 		rep.result = -EINVAL;
 		snprintf(rep.text, sizeof(rep.text), "unknown request");
 	}
-	g_mutex_unlock(&nc->lock);
+	g_mutex_unlock(&nc->rec_lock);
 	sendto(nc->ctl_fd, &rep, sizeof(rep), MSG_DONTWAIT, (struct sockaddr *)&from, flen);
 }
 
@@ -876,6 +938,7 @@ int main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 
 	g_mutex_init(&nc.lock);
+	g_mutex_init(&nc.rec_lock);
 	nc_table_init(&nc.table);
 	fwt_seqcheck_init(&nc.chk);
 	if (init_frames(&nc) != 0)
@@ -914,6 +977,13 @@ int main(int argc, char **argv)
 		}
 		fprintf(nc.log, "index,pts_ns,t_edge_ns,flags,bytes,key,matched\n");
 	}
+	if ((nc.rec_on || nc.out) &&
+	    (nc_wq_init(&nc.wq, (size_t)nc.o.write_queue_mb << 20) != 0 ||
+	     pthread_create(&nc.writer, NULL, writer_main, &nc) != 0)) {
+		fprintf(stderr, "nodecap: writer thread: %s\n", strerror(errno));
+		return 1;
+	}
+	nc.writer_on = nc.rec_on || nc.out;
 
 	struct sockaddr_un trigd;
 	int fd = subscribe(nc.o.sock_path, &trigd);
@@ -936,32 +1006,38 @@ int main(int argc, char **argv)
 		}
 		int np = poll(p, 3, nc.by_time ? 10 : 100);
 
-		push_decided(&nc, fwt_mono_now_ns());
-		if (np <= 0)
-			continue;
-		if (p[1].revents & POLLIN)
+		if (np > 0 && (p[1].revents & POLLIN))
 			handle_ctl(&nc);
-		if (p[2].revents & (POLLIN | POLLHUP | POLLERR))
-			drain_source(&nc);
-		if (!(p[0].revents & POLLIN))
-			continue;
 
+		/*
+		 * Order matters after any stall (pipeline start, scheduling): first
+		 * every waiting edge message, then every waiting frame, and only
+		 * then decide edges by the clock. Otherwise waiting frames find no
+		 * edge yet (spurious) and their edges are closed without them (gaps).
+		 */
 		struct fwt_trig_msg m;
-		ssize_t n = recv(fd, &m, sizeof(m), 0);
+		ssize_t n;
 
-		if (n < 0 || !fwt_trig_msg_valid(&m, n))
-			continue;
-		if (m.type == FWT_TRIG_END) {
-			fprintf(stderr, "nodecap: trigd ended session %" PRIu32 " at index %"
-				PRId64 "\n", m.session, m.index);
-			last_index = m.index;
-			ended = true;
-		} else if (m.type == FWT_TRIG_EDGE) {
-			if (!nc.started && start_session(&nc, &m) != 0)
-				failed = true;
-			else
-				on_edge(&nc, &m);
+		while (np > 0 && (p[0].revents & POLLIN) && !ended && !failed &&
+		       (!nc.o.count || (int64_t)nc.st.edges < nc.o.count) &&
+		       (n = recv(fd, &m, sizeof(m), MSG_DONTWAIT)) > 0) {
+			if (!fwt_trig_msg_valid(&m, n))
+				continue;
+			if (m.type == FWT_TRIG_END) {
+				fprintf(stderr, "nodecap: trigd ended session %" PRIu32 " at index %"
+					PRId64 "\n", m.session, m.index);
+				last_index = m.index;
+				ended = true;
+			} else if (m.type == FWT_TRIG_EDGE) {
+				if (!nc.started && start_session(&nc, &m) != 0)
+					failed = true;
+				else
+					on_edge(&nc, &m);
+			}
 		}
+		if (nc.by_time && !nc.cam_gone)
+			drain_source(&nc);  /* non-blocking: takes whatever is there */
+		push_decided(&nc, fwt_mono_now_ns());
 	}
 	if (!ended)
 		send_type(fd, &trigd, FWT_TRIG_UNSUBSCRIBE);
@@ -988,6 +1064,11 @@ int main(int argc, char **argv)
 			failed = true;
 		gst_element_set_state(nc.pipe, GST_STATE_NULL);
 	}
+	/* every queued frame is stored before the recorder closes */
+	if (nc.writer_on) {
+		nc_wq_close(&nc.wq);
+		pthread_join(nc.writer, NULL);
+	}
 
 	/* A missing frame at the very end shows as END index > last frame index. */
 	g_mutex_lock(&nc.lock);
@@ -1008,6 +1089,20 @@ int main(int argc, char **argv)
 		       " (refused %" PRIu64 ")\n", s->rec_frames, s->rec_skipped, s->rec_errors,
 		       nc.rec.st.segments_closed, nc.rec.st.segments_deleted, s->locks_ok,
 		       s->locks_refused);
+
+		const struct rec_stats *rs = &nc.rec.st;
+#define MS(x) ((x) / 1e6)
+		printf("timing: recorder write max %.1f ms (n %" PRIu64 "), keyframe fdatasync max "
+		       "%.1f ms avg %.1f ms (n %" PRIu64 "), segment close max %.1f ms (n %" PRIu64
+		       "), segment open max %.1f ms (n %" PRIu64 "); write queue peak %.1f MB of %u, "
+		       "overflow %" PRIu64 "; lock held by encoder output max %.1f ms, capture "
+		       "waited max %.1f ms\n",
+		       MS(rs->t_write.max_ns), rs->t_write.n, MS(rs->t_keysync.max_ns),
+		       rs->t_keysync.n ? MS(rs->t_keysync.total_ns) / (double)rs->t_keysync.n : 0,
+		       rs->t_keysync.n, MS(rs->t_close.max_ns), rs->t_close.n, MS(rs->t_open.max_ns),
+		       rs->t_open.n, nc.wq.peak_bytes / 1e6, nc.o.write_queue_mb, nc.wq.overflow,
+		       MS(s->lock_hold_max_ns), MS(s->lock_wait_max_ns));
+#undef MS
 		if (nc.ctl_fd >= 0) {
 			close(nc.ctl_fd);
 			unlink(nc.o.ctl_path);
@@ -1041,14 +1136,17 @@ int main(int argc, char **argv)
 
 	bool ok = !failed && s->frames_out == s->edges && !s->dropped_in && !nc.chk.gaps &&
 		  !nc.chk.dups && !nc.chk.backward && !s->unmatched && !s->no_vcl &&
-		  (!nc.rec_on || (s->rec_frames == s->frames_out && !s->rec_errors));
+		  (!nc.rec_on || (s->rec_frames == s->frames_out && !s->rec_errors)) &&
+		  !nc.wq.overflow && !s->out_errors;
 	g_mutex_unlock(&nc.lock);
 
 	nc.cam->ops->destroy(nc.cam);
 	if (nc.by_time)
 		fwt_clock_close(&nc.clk);
-	if (nc.out)
-		fclose(nc.out);
+	if (nc.out && fclose(nc.out) != 0)
+		ok = false;
+	if (nc.writer_on)
+		nc_wq_destroy(&nc.wq);
 	if (nc.log)
 		fclose(nc.log);
 	return ok ? 0 : 1;

@@ -37,3 +37,7 @@ add_test(NAME match COMMAND test_match)
 add_executable(test_fwtrec test_fwtrec.c)
 target_link_libraries(test_fwtrec PRIVATE fwtrec_core)
 add_test(NAME fwtrec COMMAND test_fwtrec)
+
+add_executable(test_wq test_wq.c)
+target_link_libraries(test_wq PRIVATE nodecap_core)
+add_test(NAME wq COMMAND test_wq)

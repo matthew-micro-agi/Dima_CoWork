@@ -1,7 +1,8 @@
 # Pure logic, also used by the laptop unit tests.
-add_library(nodecap_core STATIC nodecap_core.c nc_match.c nc_source_test.c nc_source_emu.c)
+add_library(nodecap_core STATIC nodecap_core.c nc_match.c nc_source_test.c nc_source_emu.c nc_wq.c)
 target_include_directories(nodecap_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(nodecap_core PUBLIC fwt_common)
+find_package(Threads REQUIRED)
+target_link_libraries(nodecap_core PUBLIC fwt_common Threads::Threads)
 
 # GStreamer from the host, or from the SDK sysroot when cross-compiling
 # (pkg-config environment set by cmake/j722s-sdk.cmake).
