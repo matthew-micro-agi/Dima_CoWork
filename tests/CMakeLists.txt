@@ -13,3 +13,7 @@ add_test(NAME sei COMMAND test_sei)
 add_executable(test_stamp test_stamp.c)
 target_link_libraries(test_stamp PRIVATE fwt_common)
 add_test(NAME stamp COMMAND test_stamp)
+
+add_executable(test_nodecap test_nodecap.c)
+target_link_libraries(test_nodecap PRIVATE nodecap_core fwt_common)
+add_test(NAME nodecap COMMAND test_nodecap)

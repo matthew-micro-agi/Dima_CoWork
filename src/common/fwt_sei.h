@@ -27,6 +27,9 @@
 #define FWT_SEI_NAL_MAX      128          /* start code + NAL, escaped, upper bound */
 #define FWT_H265_NAL_PREFIX_SEI 39
 
+/* SEI flags: the edge flags (FWT_TRIG_F_*, low bits) plus, from the top: */
+#define FWT_SEI_F_NO_EDGE (1u << 31)  /* frame had no matching edge; t_ns = T0 + PTS */
+
 extern const uint8_t FWT_SEI_UUID[16];
 
 struct fwt_sei {

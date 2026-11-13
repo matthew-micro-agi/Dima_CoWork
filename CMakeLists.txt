@@ -21,6 +21,7 @@ configure_file(src/common/fwt_version.h.in
 
 add_subdirectory(src/common)
 add_subdirectory(src/trigd)
+add_subdirectory(src/nodecap)
 add_subdirectory(src/tools/fwt-info)
 add_subdirectory(src/tools/trig-listen)
 
