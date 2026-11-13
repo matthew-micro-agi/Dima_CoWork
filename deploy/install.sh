@@ -5,13 +5,16 @@
 #   sh fwtrial-<version>/install.sh             install this release, switch to it, (re)start
 #   sh /opt/fwtrial/current/install.sh --rollback   switch back to the previous release
 #   sh /opt/fwtrial/current/install.sh --status     releases, current, service states
+#   sh /opt/fwtrial/current/install.sh --uninstall  remove everything of ours except /rec;
+#                                                   refused while a session runs
 #
 # Layout: /opt/fwtrial/releases/<version>/{bin,etc,systemd,install.sh,VERSION}
 #         /opt/fwtrial/current -> releases/<version>   (switched atomically)
 #         /opt/fwtrial/previous                        (version to roll back to)
 #         /etc/fwtrial/*.conf                          (written only if missing)
 #         /etc/systemd/system/fwtrial-*.service        (enabled: start at boot)
-# /rec (recordings) is never touched.
+#         /var/log/fwtrial, /run/fwtrial               (made by systemd for the service)
+# /rec (recordings) is never touched, not even by --uninstall.
 set -eu
 
 BASE=/opt/fwtrial
@@ -47,6 +50,56 @@ status() {
 	done
 }
 
+# Remove the installation: services, units (and drop-ins), releases, configs,
+# logs. Keeps /rec. Refused while trigd or nodecap runs (a session is armed or
+# a check script is running): end it first, nothing is cut off midway.
+uninstall() {
+	busy=$(for f in /proc/[0-9]*/comm; do
+		c=$(cat "$f" 2>/dev/null) || continue
+		case "$c" in trigd|nodecap) p=${f#/proc/}; echo "$c (pid ${p%/comm})" ;; esac
+	done)
+	if [ -n "$busy" ]; then
+		echo "uninstall: refused, running:" >&2
+		echo "$busy" | sed 's/^/  /' >&2
+		die "end the session first (disarm via the control interface, or Ctrl-C / kill the check run); then retry"
+	fi
+
+	if [ ! -e "$BASE" ] && ! ls /etc/systemd/system/fwtrial-*.service >/dev/null 2>&1; then
+		echo "uninstall: nothing installed"
+		return 0
+	fi
+	echo "uninstall: fwtrial $(current || echo '(no current release)')"
+	cd /  # this script may live in the directory being removed
+
+	# 1. stop + disable; the nodeagent unit's ExecStopPost turns the trigger output off
+	systemctl disable --now $UNITS >/dev/null 2>&1 || true
+	# and once more directly, in case the service wasn't running (DL-14)
+	if [ -x "$BASE/current/bin/trigd" ]; then
+		"$BASE/current/bin/trigd" --disarm-only >/dev/null 2>&1 || true
+	fi
+
+	# 2. units, drop-ins (systemctl edit), systemd's state
+	for u in $UNITS; do
+		rm -f "/etc/systemd/system/$u"
+		rm -rf "/etc/systemd/system/$u.d"
+	done
+	systemctl daemon-reload
+	systemctl reset-failed $UNITS >/dev/null 2>&1 || true
+
+	# 3. releases, configs, logs, runtime sockets
+	rm -rf "$BASE" /etc/fwtrial /var/log/fwtrial /run/fwtrial
+
+	# 4. check
+	left=$(systemctl list-unit-files 'fwtrial*' --no-legend 2>/dev/null || true)
+	for d in "$BASE" /etc/fwtrial /var/log/fwtrial /run/fwtrial; do
+		if [ -e "$d" ]; then left="$left $d"; fi
+	done
+	[ -z "$left" ] || die "left behind: $left"
+	echo "  removed: $UNITS (+ drop-ins), $BASE, /etc/fwtrial, /var/log/fwtrial, /run/fwtrial"
+	echo "  kept:    /rec (recordings)"
+	echo "uninstalled (install again: deploy/deploy.sh <user@node>)"
+}
+
 case "${1:-}" in
 --status)
 	status
@@ -64,10 +117,14 @@ case "${1:-}" in
 	echo "rolled back to $PREV"
 	exit 0
 	;;
+--uninstall)
+	uninstall
+	exit 0
+	;;
 "")
 	;;
 *)
-	die "usage: install.sh [--rollback | --status]"
+	die "usage: install.sh [--rollback | --status | --uninstall]"
 	;;
 esac
 
