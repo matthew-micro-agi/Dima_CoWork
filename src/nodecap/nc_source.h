@@ -3,8 +3,9 @@
  *
  *   test   built-in: one frame per trigger edge, made on the spot (binding by
  *          construction); the index is drawn into the frame (DL-17)
- *   emu    cam-emu process over a V4L2-like buffer protocol (later commit)
- *   v4l2   a real camera, /dev/videoN (later)
+ *   emu    cam-emu process over a V4L2-like buffer protocol (fwt_cam_proto.h);
+ *          frames bound to edges by time (nc_match.h, DL-27)
+ *   v4l2   a real camera, /dev/videoN (later; same binding as emu)
  *
  * Same shape as a V4L2 capture device: an fd to poll, dequeue a filled
  * buffer (data, monotonic timestamp, sequence counter), release it.
@@ -54,5 +55,9 @@ struct nc_source {
 
 /* Built-in test source: w x h NV12 patterns, one frame per edge. */
 struct nc_source *nc_source_test_new(int w, int h);
+
+/* cam-emu client: connect to path, w x h NV12, nbufs buffers, stream on.
+ * NULL on failure (reason printed). */
+struct nc_source *nc_source_emu_new(const char *path, int w, int h, int nbufs);
 
 #endif

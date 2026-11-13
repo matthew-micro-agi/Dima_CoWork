@@ -29,3 +29,7 @@ add_test(NAME nodeagent COMMAND test_nodeagent)
 add_executable(test_camemu test_camemu.c)
 target_link_libraries(test_camemu PRIVATE camemu_core fwt_common)
 add_test(NAME camemu COMMAND test_camemu)
+
+add_executable(test_match test_match.c)
+target_link_libraries(test_match PRIVATE nodecap_core fwt_common)
+add_test(NAME match COMMAND test_match)
