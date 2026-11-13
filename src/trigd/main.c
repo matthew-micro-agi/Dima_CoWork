@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -49,6 +50,8 @@ struct opts {
 	int64_t     test_skip;
 	bool        verbose;
 	bool        disarm_only;
+	const char *edges;         /* auto | measured | computed */
+	unsigned    extts;
 };
 
 static volatile sig_atomic_t g_stop;
@@ -74,6 +77,10 @@ static void usage(const char *prog)
 		"  --t0-offset-ms N    offset for the default T0 (default 1000)\n"
 		"  --count N           stop after edge index N-1 (default 0 = run until signal)\n"
 		"  --sock PATH         socket path (default %s)\n"
+		"  --edges MODE        auto (default): hardware edge timestamps if the CPTS loop\n"
+		"                      delivers them, else computed with a warning; measured;\n"
+		"                      computed (t = T0 + k*period). DL-09, setup.md section 7\n"
+		"  --extts N           CPTS timestamp input of the loop (default 2 = HW3_TS_PUSH)\n"
 		"  --test-skip N       TEST ONLY: don't publish every Nth edge (gap detection test)\n"
 		"  -v                  print every edge\n"
 		"  --disarm-only       stop the periodic output and exit (systemd ExecStopPost, DL-14)\n",
@@ -95,12 +102,15 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		{ "sock", required_argument, NULL, 'S' },
 		{ "test-skip", required_argument, NULL, 'k' },
 		{ "disarm-only", no_argument, NULL, 'D' },
+		{ "edges", required_argument, NULL, 'E' },
+		{ "extts", required_argument, NULL, 'X' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	int c;
 
 	*o = (struct opts){ .dev = "/dev/ptp0", .perout = 1, .session = 0,
+			    .edges = "auto", .extts = 2,
 			    .period_ns = trigd_period_from_fps(30),
 			    .t0_offset_ns = NSEC_PER_SEC,
 			    .sock_path = FWT_TRIGD_SOCK_DEFAULT };
@@ -125,8 +135,20 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		case 'k': o->test_skip = strtoll(optarg, NULL, 0); break;
 		case 'v': o->verbose = true; break;
 		case 'D': o->disarm_only = true; break;
+		case 'E': o->edges = optarg; break;
+		case 'X': o->extts = (unsigned)strtoul(optarg, NULL, 0); break;
 		default: return -1;
 		}
+	}
+	if (strcmp(o->edges, "auto") && strcmp(o->edges, "measured") && strcmp(o->edges, "computed"))
+		return -1;
+	if (o->period_ns % TRIGD_TICK_NS) {
+		int64_t r = trigd_period_round(o->period_ns);
+
+		fprintf(stderr, "trigd: WARNING: period %" PRId64 " ns is not a whole number of CPTS "
+			"ticks (%d ns): using %" PRId64 " ns (else the edges drift off the plan)\n",
+			o->period_ns, TRIGD_TICK_NS, r);
+		o->period_ns = r;
 	}
 	if (o->period_ns <= 0 || o->count < 0 || o->test_skip < 0)
 		return -1;
@@ -223,8 +245,11 @@ int main(int argc, char **argv)
 	struct trigd_subs subs;
 	struct edge_source *src = NULL;
 	int sfd = -1, rc = 1;
-	bool armed = false;
+	bool armed = false, measured = false;
 	int64_t now, published = 0, skipped = 0, last_index = -1;
+	/* published edges by kind; deviation of measured ones from the plan */
+	int64_t pub_measured = 0, pub_ts_missing = 0, dev_max = 0;
+	double dev_sum_sq = 0;
 
 	if (parse_opts(argc, argv, &o) != 0) {
 		usage(argv[0]);
@@ -289,9 +314,10 @@ int main(int argc, char **argv)
 
 	fprintf(stderr,
 		"trigd %s: session %" PRIu32 ", T0 %" PRId64 " ns, period %" PRId64 " ns, "
-		"clock %s, mode computed, socket %s\n",
+		"clock %s, edges %s, socket %s\n",
 		FWT_VERSION, plan.session, plan.t0_ns, plan.period_ns,
-		clk.is_phc ? o.dev : "system (test, no periodic output)", o.sock_path);
+		clk.is_phc ? o.dev : "system (test, no periodic output)",
+		clk.is_phc ? o.edges : "computed", o.sock_path);
 	if (first > 0)
 		fprintf(stderr, "trigd: T0 already passed: late join at index %" PRId64 "\n", first);
 
@@ -304,7 +330,12 @@ int main(int argc, char **argv)
 		armed = true;
 	}
 
-	src = edge_source_computed_new(&clk, &plan, first);
+	/* System clock (laptop tests): no CPTS, always computed. */
+	measured = clk.is_phc && strcmp(o.edges, "computed") != 0;
+
+	src = measured ? edge_source_measured_new(&clk, &plan, first, o.extts,
+						   !strcmp(o.edges, "auto"))
+		       : edge_source_computed_new(&clk, &plan, first);
 	if (!src) {
 		fprintf(stderr, "trigd: edge source: %s\n", strerror(errno));
 		goto out;
@@ -355,6 +386,16 @@ int main(int argc, char **argv)
 			m.period_ns = plan.period_ns;
 			publish(sfd, &subs, &m);
 			published++;
+			if (m.flags & FWT_TRIG_F_TS_MISSING) {
+				pub_ts_missing++;
+			} else if (!(m.flags & FWT_TRIG_F_COMPUTED)) {
+				int64_t d = m.t_ns - fwt_edge_time(&plan, m.index);
+
+				d = d < 0 ? -d : d;
+				pub_measured++;
+				dev_max = d > dev_max ? d : dev_max;
+				dev_sum_sq += (double)d * (double)d;
+			}
 			if (o.verbose)
 				printf("edge session %" PRIu32 " index %" PRId64 " t %" PRId64
 				       " flags 0x%x\n", m.session, m.index, m.t_ns, m.flags);
@@ -386,6 +427,13 @@ out:
 	for (int i = 0; i < subs.n; i++)
 		fprintf(stderr, "trigd: subscriber %d: sent %" PRIu64 ", dropped %" PRIu64 "\n",
 			i, subs.s[i].sent, subs.s[i].dropped);
+	if (src && measured)
+		fprintf(stderr, "trigd: edges %s: published %" PRId64 " = measured %" PRId64
+			" + without hardware timestamp %" PRId64 " + computed %" PRId64
+			"; events ignored %" PRIu64 "; measured vs plan: max %" PRId64 " ns, RMS %.1f ns\n",
+			src->name, published, pub_measured, pub_ts_missing,
+			published - pub_measured - pub_ts_missing, edge_source_measured_ignored(src),
+			dev_max, pub_measured ? sqrt(dev_sum_sq / (double)pub_measured) : 0.0);
 	if (src)
 		src->destroy(src);
 	trigd_clock_close(&clk);

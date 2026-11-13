@@ -31,6 +31,8 @@ enum fwt_trig_type {
 /* Edge flags. */
 #define FWT_TRIG_F_TIME_UNVERIFIED (1u << 0)  /* clock sync not verified (DL-13) */
 #define FWT_TRIG_F_COMPUTED        (1u << 1)  /* t_ns from schedule, not measured */
+#define FWT_TRIG_F_TS_MISSING      (1u << 2)  /* measured mode: no hardware timestamp for
+                                               * this edge; t_ns from schedule (DL-09) */
 
 struct fwt_trig_msg {
 	uint32_t magic;      /* FWT_TRIG_MAGIC */

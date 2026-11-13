@@ -13,7 +13,17 @@ int64_t trigd_t0_auto(int64_t now_ns, int64_t offset_ns)
 
 int64_t trigd_period_from_fps(int fps)
 {
-	return fps > 0 ? NSEC_PER_SEC / fps : 0;
+	if (fps <= 0)
+		return 0;
+	/* nearest whole tick to 1e9 / fps, in integers: round(1e9 / (fps * tick)) * tick */
+	int64_t d = (int64_t)fps * TRIGD_TICK_NS;
+
+	return (NSEC_PER_SEC + d / 2) / d * TRIGD_TICK_NS;
+}
+
+int64_t trigd_period_round(int64_t ns)
+{
+	return (ns + TRIGD_TICK_NS / 2) / TRIGD_TICK_NS * TRIGD_TICK_NS;
 }
 
 int64_t trigd_first_index(int64_t t0_ns, int64_t period_ns, int64_t now_ns,

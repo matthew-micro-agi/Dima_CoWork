@@ -12,9 +12,20 @@
  */
 int64_t trigd_t0_auto(int64_t now_ns, int64_t offset_ns);
 
-/* Period in ns for a frame rate (integer division: 30 fps -> 33,333,333 ns).
- * Returns 0 for fps <= 0. All nodes use the same integer period. */
+/*
+ * The CPTS makes periods in whole ticks of its 500 MHz clock (2 ns): an odd
+ * period runs 1 ns short per edge and the edges drift off the plan T0 + k*P
+ * (30 ppb at 30 fps, measured G1 2026-11-13). Periods are therefore whole ticks.
+ */
+#define TRIGD_TICK_NS 2
+
+/* Period in ns for a frame rate: the whole number of ticks nearest to 1 s / fps
+ * (30 fps -> 33,333,334 ns, 60 fps -> 16,666,666 ns). 0 for fps <= 0. All nodes
+ * use the same function, so a pack shares one period. */
 int64_t trigd_period_from_fps(int fps);
+
+/* ns rounded to the nearest whole tick (half up). */
+int64_t trigd_period_round(int64_t ns);
 
 /*
  * First edge this node can still arm: 0 if T0 is at least margin_ns in the

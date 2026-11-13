@@ -58,6 +58,7 @@ static void test_time(void)
 	CHECK(nc_index_of_pts((90 * p / 1000) * 1000, p, &idx) && idx == 90);
 
 	CHECK(nc_fps_of(33333333LL) == 30);
+	CHECK(nc_fps_of(33333334LL) == 30);  /* trigd's whole-tick period */
 	CHECK(nc_fps_of(16666666LL) == 60);
 	CHECK(nc_fps_of(0) == 0);
 }
