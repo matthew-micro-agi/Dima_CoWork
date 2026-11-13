@@ -39,7 +39,7 @@ one PTP time base on every node (gPTP, DL-01)
   - **Measure on the camera:** spread under load with fixed exposure; then set window and latency (DL-27). Sensor frame counter as the independent check.
 - **Without PTP hardware (lite tier):** the chain stays, only the time base and the edge maker change: the supervisor MCU makes the edge, disciplined by a wired pack trigger, PPS, software PTP or radio (DL-01 "Lite tier", §8.1); the choice follows the sync budget (§11.4).
 
-Rest of the summary (what runs, what was measured, what is stubbed): written last.
+What runs, what doesn't, what was skipped and what comes next: `docs/summary.md`. Every number with how it was measured: `docs/numbers.md`.
 
 ### 1.1 Time and data model: answers to the brief
 
@@ -539,10 +539,10 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 | A5 | Recorder: segments, manifest, ring, locks | no | **done** (`src/recorder`, `rec-tool`, `recorder-check.sh`) |
 | A6 | Query/fetch | no | **done** (sessions, segments, keyframe-aligned fetch) |
 | A7 | `nodeagent` control interface | no | **done** (HTTP + CBOR, ICD v1; events and configure deferred) |
-| A8 | Matching + drop detection | no | **encoder-output check done**; camera-side matching with B |
+| A8 | Matching + drop detection | no | **done:** binding by time (`nc_match`, ±3 ms) + encoder-output check; proven with the camera emulator (faults injected); calibration on the real camera with B |
 | A9 | Node simulator + conformance tests | no | open |
-| A10 | Soak and fault tests | no | open; check scripts exist (`tests/*-check.sh`) |
-| A11 | PTP with the laptop | no | bench check done (P-3); runs at boot as `fwtrial-ptp4l` (client only); gPTP profile and lock check (DL-13) open |
+| A10 | Soak and fault tests | no | **done:** 2 x 30 min at 60 fps (soak 2: 0 of 108,001 missing), fault injection via `cam-emu`, check scripts per component; unplug / power pull (M10) open |
+| A11 | PTP with the laptop | no | **done:** `fwtrial-ptp4l` at boot (client only), 51 ns RMS over 30 min; gPTP profile, lock check (DL-13) and G4 (edges vs frequency correction) open |
 | B1-B5 | Sensor driver, overlay, ISP path, real binding, strobe measurement | yes | blocked (G3) |
 
 - **Order:** A2 -> A1 + A3 + A4 -> A5 + A6 -> A7, A8 -> A10 -> A9 / A11.
