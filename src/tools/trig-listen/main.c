@@ -3,10 +3,15 @@
  * them: index continuity (gaps, duplicates) and edge time against the grid
  * T0 + index*period. Stops at trigd's END message, after --count edges, or on
  * Ctrl-C, and prints a summary. Exit code 0 only if no gap/duplicate was seen.
+ *
+ * Interval statistics (M4, trigger jitter; meaningful with hardware-measured
+ * edges, trigd --edges measured/auto): for consecutive indices, interval -
+ * period: min/max, RMS and a histogram.
  */
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -94,6 +99,12 @@ int main(int argc, char **argv)
 	struct fwt_seqcheck chk;
 	bool have_grid = false, ended = false;
 	int64_t t0 = 0, period = 0, max_dev = 0, edges = 0, last_t = 0;
+	double dev_sq = 0;
+	/* intervals between consecutive edges: d = interval - period */
+	static const int64_t bin_ns[] = { 2, 10, 100, 1000, 10000 };
+	uint64_t bins[6] = { 0 }, intervals = 0;
+	int64_t d_min = INT64_MAX, d_max = INT64_MIN, prev_index = -1, prev_t = 0;
+	double d_sq = 0;
 	uint32_t flags_or = 0, session = 0;
 
 	fwt_seqcheck_init(&chk);
@@ -145,6 +156,22 @@ int main(int argc, char **argv)
 			dev = -dev;
 		if (dev > max_dev)
 			max_dev = dev;
+		dev_sq += (double)dev * (double)dev;
+
+		if (prev_index >= 0 && m.index == prev_index + 1 && m.period_ns == period) {
+			int64_t d = (m.t_ns - prev_t) - period, a = d < 0 ? -d : d;
+			int b = 0;
+
+			while (b < 5 && a > bin_ns[b])
+				b++;
+			bins[b]++;
+			intervals++;
+			d_sq += (double)d * (double)d;
+			d_min = d < d_min ? d : d_min;
+			d_max = d > d_max ? d : d_max;
+		}
+		prev_index = m.index;
+		prev_t = m.t_ns;
 
 		edges++;
 		flags_or |= m.flags;
@@ -171,5 +198,13 @@ int main(int argc, char **argv)
 	       last_t, flags_or,
 	       (flags_or & FWT_TRIG_F_COMPUTED) ? " [computed]" : "",
 	       (flags_or & FWT_TRIG_F_TIME_UNVERIFIED) ? " [time not verified]" : "");
+	if (intervals) {
+		printf("intervals: %" PRIu64 ", interval - period: min %" PRId64 " ns, max %" PRId64
+		       " ns, RMS %.1f ns; |t - grid| RMS %.1f ns\n", intervals, d_min, d_max,
+		       sqrt(d_sq / (double)intervals), edges ? sqrt(dev_sq / (double)edges) : 0.0);
+		printf("histogram |interval - period|: <=2 ns %" PRIu64 ", <=10 ns %" PRIu64
+		       ", <=100 ns %" PRIu64 ", <=1 us %" PRIu64 ", <=10 us %" PRIu64 ", >10 us %"
+		       PRIu64 "\n", bins[0], bins[1], bins[2], bins[3], bins[4], bins[5]);
+	}
 	return (chk.gaps || chk.dups || chk.backward) ? 1 : 0;
 }
