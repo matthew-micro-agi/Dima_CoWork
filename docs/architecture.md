@@ -572,7 +572,9 @@ Each step unblocks the next. The emulator, stress tests and the CI rig grow alon
 6. **Lite tier:** RV1106 + supervisor MCU as an edge source; time base chosen by the sync budget (§11.4, DL-01 "Lite tier"); check RV1106 hardware PTP timestamps first.
 
 1 month - 1, 2, part of 3
+
 3 months - 3 (with understanding where is a blocker... 10, 100, 1000nodes), 4, part of 5
+
 6 months - 5, new issues/blockers found, integration issues, Lite platform modifications, cheaper solutions
 
 **Alongside:**
