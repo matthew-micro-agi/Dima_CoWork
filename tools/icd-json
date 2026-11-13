@@ -5,12 +5,24 @@
   icd-json to-cbor '{"session": 7, ...}'  write a JSON request as CBOR to stdout
 
 Keys are written in the order given: send request keys in the ICD's order
-(icd/fwt-icd-v1.cddl). Needs cbor2 (tools-requirements.txt, laptop venv).
+(icd/fwt-icd-v1.cddl). Needs cbor2: uses the repo's laptop venv (.venv)
+automatically when started with the system python3.
 """
 import json
+import os
 import sys
 
-import cbor2
+try:
+    import cbor2
+except ModuleNotFoundError:
+    # Started with the system python3: re-run with the repo's laptop venv
+    # (docs/setup.md 2.4), which has cbor2. Once only (no loop).
+    here = os.path.dirname(os.path.realpath(__file__))
+    venv_py = os.path.join(here, "..", ".venv", "bin", "python")
+    if os.path.exists(venv_py) and not os.environ.get("ICD_JSON_REEXEC"):
+        os.environ["ICD_JSON_REEXEC"] = "1"
+        os.execv(venv_py, [venv_py, "-I", os.path.realpath(__file__)] + sys.argv[1:])
+    sys.exit("icd-json: needs cbor2: set up the laptop venv (docs/setup.md section 2.4)")
 
 
 def main() -> int:
