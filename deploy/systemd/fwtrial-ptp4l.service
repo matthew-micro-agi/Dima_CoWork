@@ -1,0 +1,15 @@
+# fwtrial PTP client: syncs the node's PTP hardware clock (/dev/ptp0) to the
+# grandmaster; client only, never master (DL-01, DL-25). Config: /etc/fwtrial/ptp4l.conf.
+# The image's own ptp4l@.service and /etc/linuxptp/ptp4l.conf are left untouched.
+[Unit]
+Description=fwtrial PTP client (ptp4l, client only)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f /etc/fwtrial/ptp4l.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

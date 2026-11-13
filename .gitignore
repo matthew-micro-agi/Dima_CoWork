@@ -5,3 +5,6 @@ __pycache__/
 
 # CMake build directories (laptop and cross builds)
 build*/
+
+# Node bundles (deploy/make-bundle.sh)
+dist/

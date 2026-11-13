@@ -1,0 +1,32 @@
+# fwtrial node agent: the node's control interface (HTTP + CBOR, port 8080);
+# starts trigd + nodecap per armed session (DL-23). Installed by install.sh (DL-24).
+[Unit]
+Description=fwtrial node agent (control interface; trigd + nodecap per session)
+After=network-online.target fwtrial-ptp4l.service
+Wants=network-online.target
+# waits for the eMMC recordings mount (fstab: LABEL=rec /rec)
+RequiresMountsFor=/rec
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/fwtrial/nodeagent.conf
+# DL-14: trigger output off before start and after every stop, even a crash ("-": never fail on it)
+ExecStartPre=-/opt/fwtrial/current/bin/trigd --disarm-only
+ExecStart=/opt/fwtrial/current/bin/nodeagent \
+  --port ${PORT} --rec ${REC} --ring-max-mb ${RING_MAX_MB} \
+  --trigd /opt/fwtrial/current/bin/trigd --nodecap /opt/fwtrial/current/bin/nodecap \
+  "--trigd-args=${TRIGD_ARGS}" "--nodecap-args=${NODECAP_ARGS}" \
+  --log-dir /var/log/fwtrial
+ExecStopPost=-/opt/fwtrial/current/bin/trigd --disarm-only
+# SIGINT to nodeagent only: it disarms a running session cleanly; children killed only if hung
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=2
+# /run/fwtrial (sockets), /var/log/fwtrial (trigd.log, nodecap.log)
+RuntimeDirectory=fwtrial
+LogsDirectory=fwtrial
+
+[Install]
+WantedBy=multi-user.target
