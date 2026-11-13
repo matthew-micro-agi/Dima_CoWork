@@ -67,8 +67,32 @@ build_dev() {
 		pass "board build, no warnings"
 }
 
+# Installed node service (DL-24): board runs use the same port, sockets and
+# /rec, so pause it for the run and start it again afterwards, also on failure.
+SVC=fwtrial-nodeagent.service
+SVC_NODE=""
+
+svc_pause() {
+	SVC_NODE=$1
+	if ssh -o BatchMode=yes "$SVC_NODE" "systemctl is-active --quiet $SVC"; then
+		ssh -o BatchMode=yes "$SVC_NODE" "systemctl stop $SVC" &&
+			echo "== installed $SVC paused for this run" &&
+			trap svc_resume EXIT
+	else
+		SVC_NODE=""
+	fi
+}
+
+svc_resume() {
+	[ -n "$SVC_NODE" ] || return 0
+	ssh -o BatchMode=yes "$SVC_NODE" "systemctl start $SVC" &&
+		echo "== installed $SVC started again"
+	SVC_NODE=""
+}
+
 # finish <mode>: overall result and exit code
 finish() {
+	svc_resume
 	echo
 	if [ $FAILS -eq 0 ]; then
 		echo "ALL PASSED ($1). Logs: $LOG"

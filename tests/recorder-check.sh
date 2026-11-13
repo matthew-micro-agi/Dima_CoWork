@@ -155,6 +155,7 @@ host)
 	;;
 dev)
 	[ -n "$NODE" ] || usage
+	svc_pause "$NODE"
 	build_dev && run_dev
 	;;
 *)
