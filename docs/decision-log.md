@@ -36,6 +36,7 @@ All dates 2026-11-12.
 | DL-26 | Camera emulator: separate test process with a V4L2-like buffer protocol |
 | DL-27 | Frame-to-edge binding by time, shared by all camera sources |
 | DL-28 | Laptop recording client in C (`fwt-rec`), start of the controller code |
+| DL-29 | Operator host bundle and read-only pre-checks (`fwt-doctor`) |
 
 ---
 
@@ -250,3 +251,13 @@ All dates 2026-11-12.
 - **Alternatives:** Python with cbor2 (a third of the code, laptop only, nothing for the controller); `curl` + `tools/icd-json` by hand (kept for single requests); hand-written HTTP client (no dependency, but chunking, timeouts and errors to get right).
 - **Seen:** zcbor writes a map with optional keys (`arm-req`) as indefinite length (`bf ... ff`), cbor2 as definite: both valid CBOR, both decoded by either side.
 - **Later:** several nodes with one explicit T0 (the controller's fan-out); `--lock` and `--last N`; live frame count in `/health` (now per closed segment).
+
+## DL-29 Operator host bundle and read-only pre-checks (`fwt-doctor`)
+
+- **Decision:** three kinds of machine, each with its own check: **operator laptop** (deploy, record, check; builds nothing), **developer laptop** (also builds: laptop libraries, venv, TI SDK), **board**. `tools/fwt-doctor host | host-dev | dev <node>` checks them read-only and says what is missing and the fix (with the setup section). The operator gets a **host bundle** `fwtrial-host-<version>-x86_64.tar.gz`: `bin/fwt-rec`, `bin/sei-dump`, `bin/fwt-doctor`, `deploy.sh` + `install.sh`, the node bundle of the same version, a README. `deploy.sh` installs a prebuilt bundle (`--bundle FILE`, or the one next to it in a host bundle) and checks the version with `fwt-rec --info` (no Python).
+- **Why:** before this, deploying needed the whole build setup, and a missing package or SSH key showed up mid-run as a confusing error. Now an operator needs four apt packages and SSH; problems are named before anything runs.
+- **Doctor rules:** read-only (installs, starts, stops nothing); FAIL = won't work, WARN = works but not as expected (`-dirty` test build, no PTP grandmaster, fwtrial not installed); checks grouped (`tools`, `bins`, `build`, `sdk`, `link`, `node`) so each caller asks only for what it needs. Bash: it mostly calls `pkg-config`, `gst-inspect`, `ssh`, `systemctl`; readable and extendable by anyone.
+- **Check scripts:** run the matching groups first and stop on a FAIL, showing the doctor's findings.
+- **Alternatives:** packages (`.deb` for the laptop; `opkg` for the node): proper dependencies, but packaging work and a feed; static linking of the host programs (portable across distributions, but static libcurl drags its TLS stack); doctor in C (no gain for a script of tool calls).
+- **Limits:** host programs built on Ubuntu 24.04 x86_64; another distribution needs its own build (or the packages above).
+- **Later:** `.deb` + `opkg`/Yocto packages; the doctor's `node` group as a `nodeagent` health self-test.

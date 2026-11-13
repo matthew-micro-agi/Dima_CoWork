@@ -10,6 +10,21 @@ Names used below:
 - **SDK:** `~/ti/ti-processor-sdk-linux-adas-j722s-evm-11_02_02_05`.
 - **Repo:** `~/Dima_CoWork`.
 
+**Two paths:**
+
+| Who | Needs | Sections |
+|---|---|---|
+| **Operator:** deploy a node, record, check; builds nothing | the host bundle `fwtrial-host-<version>-x86_64.tar.gz` (its `README`), SSH to the board | §3 (link), §8.7 |
+| **Developer:** builds, tests, changes the code | everything below | §2-§8 |
+
+**First, on any machine: `tools/fwt-doctor`** (read-only; says what is missing and the fix, with the section here):
+```sh
+tools/fwt-doctor host-dev root@10.42.0.132   # developer laptop + link
+tools/fwt-doctor dev root@10.42.0.132        # the board
+bin/fwt-doctor host root@10.42.0.132         # operator laptop (in the host bundle)
+```
+Each line OK / WARN (works, not as expected) / FAIL (won't work) + `fix:`; exit code 0 if no FAIL. Groups: `tools` (ssh, curl, ffmpeg), `bins` (fwt-rec, sei-dump), `build` (compiler, dev libraries, GStreamer elements, venv), `sdk` (TI SDK, sysroot), `link` (route, ping, SSH key, control interface), `node` (board: kernel, `/dev/ptp0`, Wave5, `/rec`, `/tmp`, libraries, installed version, services, PTP state, running sessions, clock sync); `--only GROUPS` picks some.
+
 ---
 
 ## 1. Bench hardware
@@ -75,7 +90,7 @@ sudo apt install -y \
 ```
 The dev packages are only for building and testing on the laptop; board binaries are always built against the SDK sysroot. The laptop has GStreamer 1.24, the board 1.22: avoid APIs newer than 1.22.
 
-**Verify:** `command -v ptp4l phc2sys cmake ffprobe` and `gst-inspect-1.0 x265enc`, `gst-inspect-1.0 h265parse` (laptop encoder for `nodecap-check.sh host`); `pkg-config --modversion libcurl` (for `fwt-rec`, §8.4; without it the build skips `fwt-rec`).
+**Verify:** `tools/fwt-doctor host-dev` (all of §2), or by hand: `command -v ptp4l phc2sys cmake ffprobe` and `gst-inspect-1.0 x265enc`, `gst-inspect-1.0 h265parse` (laptop encoder for `nodecap-check.sh host`); `pkg-config --modversion libcurl` (for `fwt-rec`, §8.4; without it the build skips `fwt-rec`).
 
 ### 2.4 Python tools (venv)
 
@@ -136,7 +151,7 @@ The SD card's TI Edge AI image is used **as shipped**. Expected state:
 | PTP clock | `/dev/ptp0`, `ethtool -T eth0` shows hardware TX/RX timestamping |
 | Runtime tools | `gst-inspect-1.0 v4l2h265enc`, `ptp4l`, `phc2sys`, `mkfs.ext4`, `mmc`, `gdbserver` present |
 
-**Verify (read-only):**
+**Verify (read-only):** `tools/fwt-doctor dev root@10.42.0.132`, or by hand:
 ```sh
 ssh root@10.42.0.132 \
   'grep -E "dorprocboot|name_overlays" /run/media/BOOT-mmcblk1p1/uEnv.txt; \
@@ -262,6 +277,8 @@ tests/trigd-check.sh host
 tests/nodecap-check.sh dev root@10.42.0.132
 ```
 Laptop runs use 960x600: the laptop's software encoder can't hold 30 fps at 1920x1200 and drops frames. The board runs full resolution. `camemu-check` runs the laptop at 30 fps: x265 can't keep up with the emulator's noisy frames at 60 fps.
+
+**Pre-checks:** every script starts with `fwt-doctor` (`tools,build` before the laptop build, `sdk` before the cross-build, `link,node` before touching the board) and stops there on a FAIL, showing what is missing and the fix; warnings are shown and the run goes on.
 
 **Verify:** each ends with `ALL PASSED (<mode>)`. Every step prints PASS/FAIL with the compared values; full logs in the `/tmp/<name>-check.XXXXXX` directory named at the end. Nothing is installed on the board (binaries and output in `/tmp`, a RAM disk).
 
@@ -452,12 +469,13 @@ Then adapt `src/nodeagent/main.c` to new or changed struct fields (the compiler 
 
 ### 8.6 Deploy to the node (installed service, starts at boot)
 
-From a checkout to a running node with **one command** (DL-24). It needs the TI SDK (§2.2), the laptop venv (§2.4, for the version check), `/rec` on the node (§6) and SSH as root (§3).
+From a checkout to a running node with **one command** (DL-24). It needs the TI SDK (§2.2), `/rec` on the node (§6) and SSH as root (§3); no Python.
 ```sh
 cd ~/Dima_CoWork && \
 deploy/deploy.sh root@10.42.0.132
 ```
-It runs `deploy/make-bundle.sh` (cross-build + tarball), copies the tarball to the node, runs `install.sh` there, then checks from the laptop that `GET /v1/identity` reports the new version.
+It runs the link pre-check (`fwt-doctor --only link`), `deploy/make-bundle.sh` (cross-build + tarball), copies the tarball to the node, runs `install.sh` there, then checks from the laptop that the node answers with the new version (`fwt-rec --info`; `curl` if `fwt-rec` isn't built).
+- **Prebuilt node bundle** (no build): `deploy/deploy.sh root@10.42.0.132 --bundle dist/fwtrial-<version>-aarch64.tar.gz`.
 
 **Expected end:**
 ```
@@ -468,7 +486,7 @@ installed 0.1.0-g<commit> (rollback: sh /opt/fwtrial/current/install.sh --rollba
 DEPLOYED 0.1.0-g<commit> to root@10.42.0.132 ...
 ```
 - **Version:** project version + git commit; `-dirty` if the checkout has uncommitted changes (`make-bundle.sh` warns). Deploy committed code.
-- **Bundle only** (offline, hand to someone else): `deploy/make-bundle.sh` -> `dist/fwtrial-<version>-aarch64.tar.gz` (~400 KB). Install by hand on the node:
+- **Bundle only** (offline): `deploy/make-bundle.sh` -> `dist/fwtrial-<version>-aarch64.tar.gz` (~400 KB). For someone without build tools, hand over the host bundle instead (§8.7). Install by hand on the node:
   ```sh
   scp dist/fwtrial-<version>-aarch64.tar.gz root@10.42.0.132:/tmp/ && \
   ssh root@10.42.0.132 \
@@ -540,6 +558,35 @@ uninstalled (install again: deploy/deploy.sh <user@node>)
 Verified: refusal with a session running; uninstall left no unit, path, boot link or process, port 8080 closed, `/rec` listing unchanged; reinstall wrote fresh default configs and listed the old recordings; services back after a reboot.
 
 Not yet: Yocto layer (`meta-fwtrial`), signed bundles.
+
+### 8.7 Host bundle for operators (deploy, record, check without build tools)
+
+One tarball with everything an operator needs (DL-29). Build it on a developer laptop from a **committed** checkout (otherwise the version ends in `-dirty` and `fwt-doctor` warns about a test build):
+```sh
+cd ~/Dima_CoWork && \
+deploy/make-host-bundle.sh
+```
+-> `dist/fwtrial-host-<version>-x86_64.tar.gz` (~600 KB):
+
+| Path | What |
+|---|---|
+| `README` | the operator's page: what to install, check, deploy, status, record, rollback, uninstall, problems |
+| `VERSION` | version, commit, build date and machine |
+| `deploy.sh`, `install.sh` | deploy the node bundle next to them (`./deploy.sh <node>`), `--uninstall` |
+| `fwtrial-<version>-aarch64.tar.gz` | the node bundle (same version as the host programs; checked) |
+| `bin/fwt-rec`, `bin/sei-dump`, `bin/fwt-doctor` | record + status, stream check, pre-checks |
+
+On the operator laptop (Ubuntu 24.04, x86_64: the host programs are built on this laptop; another distribution needs its own build):
+```sh
+sudo apt install openssh-client curl ffmpeg libcurl4t64
+tar xzf fwtrial-host-<version>-x86_64.tar.gz && \
+cd fwtrial-host-<version> && \
+bin/fwt-doctor host root@10.42.0.132 && \
+./deploy.sh root@10.42.0.132 && \
+mkdir -p ~/rec && \
+bin/fwt-rec 10.42.0.132 --duration 30 --out ~/rec/run1.h265
+```
+**Verify:** `DEPLOYED <version>`, then `check: passed … pixels ok` and `OK`. Verified from a bundle unpacked outside the repo: doctor, deploy, `--info`, a 10 s recording at 60 fps (601 frames, pixels ok), `fwt-doctor dev`.
 
 ---
 
