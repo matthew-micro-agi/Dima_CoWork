@@ -48,6 +48,7 @@ struct opts {
 	const char *sock_path;
 	int64_t     test_skip;
 	bool        verbose;
+	bool        disarm_only;
 };
 
 static volatile sig_atomic_t g_stop;
@@ -74,7 +75,8 @@ static void usage(const char *prog)
 		"  --count N           stop after edge index N-1 (default 0 = run until signal)\n"
 		"  --sock PATH         socket path (default %s)\n"
 		"  --test-skip N       TEST ONLY: don't publish every Nth edge (gap detection test)\n"
-		"  -v                  print every edge\n",
+		"  -v                  print every edge\n"
+		"  --disarm-only       stop the periodic output and exit (systemd ExecStopPost, DL-14)\n",
 		prog, FWT_TRIGD_SOCK_DEFAULT);
 }
 
@@ -92,6 +94,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		{ "count", required_argument, NULL, 'n' },
 		{ "sock", required_argument, NULL, 'S' },
 		{ "test-skip", required_argument, NULL, 'k' },
+		{ "disarm-only", no_argument, NULL, 'D' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -121,12 +124,13 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		case 'S': o->sock_path = optarg; break;
 		case 'k': o->test_skip = strtoll(optarg, NULL, 0); break;
 		case 'v': o->verbose = true; break;
+		case 'D': o->disarm_only = true; break;
 		default: return -1;
 		}
 	}
 	if (o->period_ns <= 0 || o->count < 0 || o->test_skip < 0)
 		return -1;
-	if (o->session == 0) {
+	if (o->session == 0 && !o->disarm_only) {
 		/* The session number comes with the plan, never made up here (DL-20). */
 		fprintf(stderr, "trigd: --session N (> 0) is required: the plan maker "
 			"(controller, or the laptop in the trial) assigns it\n");
@@ -243,7 +247,20 @@ int main(int argc, char **argv)
 
 	/* Clear a periodic output left running by an earlier run. */
 	if (clk.is_phc)
-		trigd_perout_disarm(clk.fd, o.perout);
+		r = trigd_perout_disarm(clk.fd, o.perout);
+
+	/* After any stop of the node service, even a crash (DL-14): output off, exit. */
+	if (o.disarm_only) {
+		if (!clk.is_phc)
+			fprintf(stderr, "trigd: --disarm-only with the system clock: nothing to do\n");
+		else if (r)
+			fprintf(stderr, "trigd: disarm of output %u on %s failed: %s\n", o.perout,
+				o.dev, strerror(-r));
+		else
+			fprintf(stderr, "trigd: output %u on %s disarmed\n", o.perout, o.dev);
+		trigd_clock_close(&clk);
+		return r ? 1 : 0;
+	}
 
 	trigd_subs_init(&subs);
 	sfd = open_socket(o.sock_path);

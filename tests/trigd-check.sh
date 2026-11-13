@@ -92,6 +92,15 @@ run_dev() {
 	grep -q "trigd rc=0" "$LOG/d2.log" && grep -q "output disarmed" "$LOG/d2.log" &&
 		pass "board SIGINT: trigd exit 0, output disarmed" ||
 		fail "board SIGINT: exit/disarm (see $LOG/d2.log)"
+
+	echo "== board: kill -9, then --disarm-only (DL-14)"
+	ssh -o BatchMode=yes "$NODE" \
+		'/tmp/trigd --session '"$(new_session)"' 2>/dev/null & TP=$!; sleep 2; \
+		 kill -9 $TP; wait $TP 2>/dev/null; \
+		 /tmp/trigd --disarm-only; echo "disarm rc=$?"' >"$LOG/d3.log" 2>&1
+	grep -q "output 1 on /dev/ptp0 disarmed" "$LOG/d3.log" && grep -q "disarm rc=0" "$LOG/d3.log" &&
+		pass "board kill -9: --disarm-only stopped the output, exit 0" ||
+		fail "board kill -9 + --disarm-only (see $LOG/d3.log)"
 }
 
 case "$MODE" in
