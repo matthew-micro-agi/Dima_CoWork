@@ -31,6 +31,8 @@ All dates 2026-11-12.
 | DL-21 | Recorder v1: full scope |
 | DL-22 | Control interface reads the recordings index read-only |
 | DL-23 | Session start: nodeagent starts trigd + nodecap per session |
+| DL-24 | Deploy: tarball + install script, release directories, systemd |
+| DL-25 | PTP on the node as a systemd service |
 
 ---
 
@@ -135,8 +137,8 @@ All dates 2026-11-12.
 ## DL-14 Trigger output after a trigger-daemon crash
 
 - **Problem:** a crash or `SIGKILL` skips the disarm; the hardware keeps firing edges. Linux can't report whether an output is running.
-- **Now:** no change. `trigd` stops the output unconditionally at every start; the risk window is crash -> next start. Unannounced frames are flagged as spurious by the capture process.
-- **If time allows:** systemd `ExecStopPost=` -> `trigd --disarm-only` (runs after every exit, including `SIGKILL`) + `Restart=on-failure`.
+- **Now (implemented with DL-24):** systemd `ExecStopPost=` -> `trigd --disarm-only` runs after every stop of the node service, including a crash or `SIGKILL`; `Restart=on-failure`. `trigd` also still stops the output at every start. Unannounced frames are flagged as spurious by the capture process.
+- **Remaining window:** `trigd` crashing while `nodeagent` keeps running: `nodeagent` sees the child die and stops the session; the output is disarmed at the next stop or `trigd` start.
 - **Not planned:** crash marker file; silence detection in consumers (comes with the capture process); disarm from a crash signal handler (useless against `SIGKILL`).
 
 ## DL-15 Frame timestamp (PTS) = edge time - T0
@@ -197,4 +199,18 @@ All dates 2026-11-12.
 - **Decision:** `nodeagent` is the only long-running process. `POST /v1/arm {session, t0?, fps}` starts `trigd` and `nodecap --rec /rec` as child processes for that session; disarm stops them cleanly; one session at a time; a child that dies stops the session and shows in health.
 - **Why:** smallest working path for the trial; the HTTP interface is the same as the product's.
 - **Alternative (product):** `trigd` and `nodecap` run permanently and receive session plans over local sockets (DL-12), supervised by systemd (DL-14).
+
+## DL-24 Deploy: tarball + install script, release directories, systemd
+
+- **Decision:** `deploy/make-bundle.sh` cross-builds and packs `fwtrial-<version>-aarch64.tar.gz` (binaries, systemd units, default configs, `install.sh`, `VERSION`). `deploy/deploy.sh <user@node>` is the one command: bundle -> copy -> `install.sh` on the node -> check `GET /v1/identity` reports the new version. On the node: `/opt/fwtrial/releases/<version>/`, symlink `/opt/fwtrial/current` switched atomically, previous release kept, `install.sh --rollback`; units enabled (start at boot); configs in `/etc/fwtrial/` written only if missing; `/rec` never touched. Version = project version + git commit (`-dirty` if uncommitted).
+- **Why:** a newcomer goes from checkout to a running service with one command; reboot-safe; release + symlink gives rollback, the same idea as the product's A/B update; reuses CMake's install rules.
+- **Alternatives:** `opkg` package (the image has opkg; needs packaging metadata and a feed); Yocto image now (product path, architecture §9; too much for the trial); copying into `/usr/local` (no rollback, hard to clean up).
+- **Check scripts:** board runs stop the installed service first and start it again afterwards (they use the same port, sockets and `/rec`).
+- **Later:** Yocto recipe in `meta-fwtrial` installing the same units and configs; signed bundles.
+
+## DL-25 PTP on the node as a systemd service
+
+- **Decision:** own unit `fwtrial-ptp4l.service` with own config `/etc/fwtrial/ptp4l.conf`: client only (never becomes master), layer-2 transport, hardware timestamps, `eth0`; enabled at boot, can be disabled on its own. The image's `ptp4l@.service` and `/etc/linuxptp/ptp4l.conf` stay untouched (their default allows the node to become master).
+- **Why:** trigger edges are scheduled on PTP time (DL-01); time sync must start with the node, not by hand.
+- **Later:** gPTP profile settings, lock state checked by `trigd`/`nodeagent` (DL-13), `phc2sys` if the system clock must follow (lock expiry uses the wall clock).
 
