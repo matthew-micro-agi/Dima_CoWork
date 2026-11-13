@@ -1,0 +1,55 @@
+fwtrial host bundle: deploy a recording node, record, check
+==========================================================
+
+Everything runs from this directory. Node: root@10.42.0.132 below; use yours.
+Nothing here builds code; the node software is the fwtrial-*-aarch64.tar.gz
+next to this file. Version: see VERSION.
+
+Laptop needs (Ubuntu 24.04, x86_64)
+-----------------------------------
+  sudo apt install openssh-client curl ffmpeg libcurl4t64
+
+  SSH key login to the node as root:   ssh-copy-id root@10.42.0.132
+  (after the board's SD card was reflashed:   ssh-keygen -R 10.42.0.132)
+
+1. Check this laptop and the link (read-only; says what is missing and how to fix it)
+-------------------------------------------------------------------------------------
+  bin/fwt-doctor host root@10.42.0.132
+  bin/fwt-doctor dev root@10.42.0.132      the node itself (encoder, /rec, services, PTP)
+
+  OK / WARN (works, not as expected) / FAIL (won't work) + "fix:" line.
+
+2. Deploy the node software (starts at boot; recordings in /rec are kept)
+-------------------------------------------------------------------------
+  ./deploy.sh root@10.42.0.132
+
+  Ends with:   DEPLOYED <version> to root@10.42.0.132
+  Back to the previous version:
+    ssh root@10.42.0.132 sh /opt/fwtrial/current/install.sh --rollback
+  Remove everything but the recordings (refused while recording):
+    ./deploy.sh root@10.42.0.132 --uninstall
+
+3. Node status (read-only)
+--------------------------
+  bin/fwt-rec 10.42.0.132 --info
+
+4. Record
+---------
+  mkdir -p ~/rec
+  bin/fwt-rec 10.42.0.132 --duration 30 --out ~/rec/run1.h265
+  bin/fwt-rec 10.42.0.132 --duration 30 --fps 60 --out ~/rec/run2.h265
+
+  Arms a new session, records for the duration (on the node's clock),
+  disarms (also on Ctrl-C), fetches the whole session into the file, writes
+  FILE.json next to it (node, versions, session, frames, missing) and checks
+  the file with sei-dump. Ends with "check: passed ... pixels ok" and "OK".
+  Exit code 0 = recorded, nothing missing, check passed.
+
+  Play:   ffplay ~/rec/run1.h265
+  Check a file again:   bin/sei-dump -q ~/rec/run1.h265
+
+Problems
+--------
+  Start with bin/fwt-doctor (step 1). On the node:
+    ssh root@10.42.0.132 sh /opt/fwtrial/current/install.sh --status
+    ssh root@10.42.0.132 journalctl -u fwtrial-nodeagent -b --no-pager | tail -20
