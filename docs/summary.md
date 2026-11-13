@@ -75,7 +75,7 @@ Details in architecture §11.4 and §11.5. In short:
 
 ## 8. What next, in order
 
-From architecture §11.2; each step unblocks the next.
+From architecture §11.2; each step unblocks the next. Time frames (draft): 1 month: steps 1, 2 and part of 3; 3 months: 3 (find where it breaks at 10, 100, 1000 nodes), 4 and part of 5; 6 months: the rest of 5, issues found on the way, the lite platform (6), cheaper solutions.
 1. **Real camera chain:** CPTS driver patch (G4) and a 30-min PTP-locked rerun; trigger to the connector pin + logic analyzer; sensor driver, overlay, ISP; binding calibrated on the camera (latency spread, window, sensor frame counter).
 2. **Robustness on one node:** recovery tests (unplug, power pull), PTP lock check, complete health and events, days-long runs.
 3. **Several nodes:** second board, PTP-aware switch, controller fan-out from `fwt-rec`'s protocol layer; skew per index across nodes; absolute accuracy; conformance suite.

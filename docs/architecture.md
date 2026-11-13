@@ -548,7 +548,7 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 - **Order:** A2 -> A1 + A3 + A4 -> A5 + A6 -> A7, A8 -> A10 -> A9 / A11.
 - **Critical path for real video:** camera connected -> driver + overlay -> ISP -> binding. B replaces A3; everything else stays.
 
-### 11.2 Next steps, in order (draft, no time frames yet)
+### 11.2 Next steps, in order, with time frames (draft)
 
 Each step unblocks the next. The emulator, stress tests and the CI rig grow alongside, as the tests each step needs.
 
@@ -562,7 +562,7 @@ Each step unblocks the next. The emulator, stress tests and the CI rig grow alon
    - PTP lock check and `time_verified` (DL-13), gPTP profile, PTP state in health;
    - health and events complete (PTP, eMMC wear alarms, temperature; events over SSE);
    - long runs: days instead of 30 min (eMMC wear per day, ring, thermal, long sessions); faults during fetch and lock, full disk.
-   - CI, clear deploy and firmware updates
+   - CI rig (nightly checks on a board), a clear deploy and firmware-update path for the bench fleet (today's bundles + rollback, made unattended); the product A/B update is step 5.
 3. **Several nodes:** second board, PTP-aware switch, controller fan-out (one plan, one T0 to all; built from `fwt-rec`'s `ctl_node`, DL-28); measure edge skew per index across nodes and absolute accuracy (G2: PPS + scope); conformance suite / node simulator (A9, §8). With it: control-interface authentication and network hardening (Security track, b).
 4. **More sensors per node:**
    - two cameras: both on the same edge (one pin or two CPTS outputs); **encoder budget:** Wave5 measured ~100 fps at 1920x1200 (P-1), so 2 x 60 fps does not fit (2 x 30 fps, lower resolution, or a split to verify);
@@ -571,11 +571,11 @@ Each step unblocks the next. The emulator, stress tests and the CI rig grow alon
 5. **Product platform:** Yocto layer `meta-fwtrial`, A/B rootfs with boot counting (e.g. RAUC), signed bundles, secure boot (HS-SE) and device identity (§9); the rest of the Security track (c).
 6. **Lite tier:** RV1106 + supervisor MCU as an edge source; time base chosen by the sync budget (§11.4, DL-01 "Lite tier"); check RV1106 hardware PTP timestamps first.
 
-1 month - 1, 2, part of 3
-
-3 months - 3 (with understanding where is a blocker... 10, 100, 1000nodes), 4, part of 5
-
-6 months - 5, new issues/blockers found, integration issues, Lite platform modifications, cheaper solutions
+| Horizon | Steps |
+|---|---|
+| 1 month | 1, 2, part of 3 |
+| 3 months | 3 (find where it breaks: 10, 100, 1000 nodes), 4, part of 5 |
+| 6 months | rest of 5; new issues and blockers found on the way, integration issues; lite platform modifications (6); cheaper solutions |
 
 **Alongside:**
 - **Security track** (the bench is open today, G5):
@@ -591,12 +591,12 @@ Each step unblocks the next. The emulator, stress tests and the CI rig grow alon
 |---|---|---|
 | 1 | Sensor driver + ISP tuning on TI (AR0235 not in TI's list) | Trial on a supported camera; AR0234 as stepping stone; TI FAE early |
 | 2 | Trigger pin routing (GENF to J1 pin 18) and camera trigger support | Check the pin mux now; DMTimer + PTP or jumper as fallback; camera chosen by trigger support |
-| 3 | Frame-to-trigger binding under load | Time-based matching, three checks, injected drops, soak |
+| 3 | Frame-to-trigger binding under load | Time-based matching, three checks, injected drops, soak. Shown with the emulator: soak 2 lost 0 of 108,001 frames, 0 with a wrong index; remaining: latency spread on the real camera |
 | 4 | Second node implementation diverges | §8 requirements + conformance suite + simulator |
 | 5 | eMMC endurance 24/7 | Sizing, EXT_CSD monitoring (M2), industrial parts |
-| 6 | Multi-node time syncronization | Need to bring up this setup and measure |
-| 7 | Deployment in production with hundreds of sensors (network/storage bandwidth + storage lifetime) | Need to figure out requirements earlier |
-| 8 | Security risks | This is not clear, depends on reqs, figure out the thread model |
+| 6 | Multi-node time synchronization | Need to bring up this setup and measure: G4 driver patch first (edges follow PTP), then second board + PTP-aware switch, skew per index measured (§11.2 step 3) |
+| 7 | Deployment in production with hundreds of sensors (network/storage bandwidth + storage lifetime) | Need to figure out requirements earlier: bitrate x nodes on switch uplinks and PC ingest; eMMC writes per day vs rated endurance (M2, M3) |
+| 8 | Security risks | Not clear yet, depends on requirements: threat model first (§11.2 security track a), then authentication and hardening with several nodes (G5) |
 
 ### 11.4 Positions on AC §12
 
