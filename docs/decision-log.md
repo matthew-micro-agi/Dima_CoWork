@@ -33,6 +33,8 @@ All dates 2026-11-12.
 | DL-23 | Session start: nodeagent starts trigd + nodecap per session |
 | DL-24 | Deploy: tarball + install script, release directories, systemd |
 | DL-25 | PTP on the node as a systemd service |
+| DL-26 | Camera emulator: separate test process with a V4L2-like buffer protocol |
+| DL-27 | Frame-to-edge binding by time, shared by all camera sources |
 
 ---
 
@@ -213,4 +215,19 @@ All dates 2026-11-12.
 - **Decision:** own unit `fwtrial-ptp4l.service` with own config `/etc/fwtrial/ptp4l.conf`: client only (never becomes master), layer-2 transport, hardware timestamps, `eth0`; enabled at boot, can be disabled on its own. The image's `ptp4l@.service` and `/etc/linuxptp/ptp4l.conf` stay untouched (their default allows the node to become master).
 - **Why:** trigger edges are scheduled on PTP time (DL-01); time sync must start with the node, not by hand.
 - **Later:** gPTP profile settings, lock state checked by `trigd`/`nodeagent` (DL-13), `phc2sys` if the system clock must follow (lock expiry uses the wall clock).
+
+## DL-26 Camera emulator: separate test process with a V4L2-like buffer protocol
+
+- **Decision:** `cam-emu`, a separate process for testing only (not in the node bundle), plays a sensor wired to the trigger: it subscribes to `trigd` and delivers one frame per edge after a configured latency ± jitter, with its own monotonic timestamp and sequence counter. Its local-socket protocol mirrors V4L2 step by step: format, request N buffers (one shared-memory file, fd handed over), queue / dequeue buffers, stream on / off. With no buffer queued the frame is lost and the sequence still advances, as with a real driver.
+- **Faults on request:** drop %, extra (spurious) frames %, latency + jitter, late frames beyond the match window, sequence jump; content: a moving, noisy pattern.
+- **Ground truth:** the emulator draws the true edge index into each frame (a special value for spurious frames); `nodecap` must find the index by timing alone; `sei-dump` compares SEI index and drawn index frame by frame.
+- **Why:** a real camera is a file descriptor delivering buffers with a timestamp and a sequence counter; an emulator behind the same kind of interface tests the code path a camera will use, including back-pressure (frames lost when all buffers are held), and keeps test code out of the node.
+- **Alternatives:** emulator inside `nodecap` (easier, but a path no camera uses); frames through a pipe (copies 3.5 MB per frame, unlike a camera); `vivid` kernel driver (real V4L2, but free-running, can't be triggered); `v4l2loopback` (a real `/dev/videoN`, but an out-of-tree module that must be built for the board kernel, same issue as the sensor driver).
+- **`nodecap` sources:** `--src test` (built-in, kept as a second path), `--src emu` (this emulator), later `--src v4l2:/dev/videoN` (camera: same calls as `ioctl`s).
+
+## DL-27 Frame-to-edge binding by time, shared by all camera sources
+
+- **Decision:** for external frame sources (emulator, camera) `nodecap` converts edge times from PTP to monotonic time and binds a frame to the edge whose time + expected latency is closest, within ± half a period (architecture §4.4). No edge in the window -> spurious frame, flagged, no invented index; edge without a frame -> gap; sequence jumps cross-checked with gaps. Expected latency configured (`--cam-latency-ms`, default 25 ms) with a warning when frames sit far from it.
+- **Why:** the index must come from the trigger, never from counting frames; the same logic then serves the emulator now and the camera later.
+- **Later:** latency measured automatically at session start; the sensor's own frame counter as a third check.
 
