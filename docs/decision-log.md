@@ -22,6 +22,9 @@ All dates 2026-11-12.
 | DL-12 | Session plan delivery and start time |
 | DL-13 | Clock not verified as synchronised |
 | DL-14 | Trigger output after a trigger-daemon crash |
+| DL-15 | Frame timestamp (PTS) = edge time - T0 |
+| DL-16 | SEI insertion: our own C code now, GStreamer element later |
+| DL-17 | Frame index drawn into test frames |
 
 ---
 
@@ -48,6 +51,7 @@ All dates 2026-11-12.
 - **Why:** data path; GStreamer's API is C; SDK cross-compiler ready; small footprint, fits the lite tier (one Cortex-A7, 128-256 MB). `libmicrohttpd` already on board and in the SDK.
 - **Alternatives:** Rust: likely long-term choice (safety, official GStreamer plugins), cross-toolchain setup too long for a prototype; product option. Python: rejected (slow, heavy, less control).
 - Laptop-only tools are not firmware; their language is separate.
+- Stream checker (`sei-dump`, reads the per-frame SEI on the laptop): C, sharing the SEI code with the node.
 
 ## DL-03 Control-interface encoding: CBOR + CDDL + zcbor
 
@@ -128,3 +132,24 @@ All dates 2026-11-12.
 - **Now:** no change. `trigd` stops the output unconditionally at every start; the risk window is crash -> next start. Unannounced frames are flagged as spurious by the capture process.
 - **If time allows:** systemd `ExecStopPost=` -> `trigd --disarm-only` (runs after every exit, including `SIGKILL`) + `Restart=on-failure`.
 - **Not planned:** crash marker file; silence detection in consumers (comes with the capture process); disarm from a crash signal handler (useless against `SIGKILL`).
+
+## DL-15 Frame timestamp (PTS) = edge time - T0
+
+- **Decision:** each frame's presentation timestamp (PTS) in the pipeline = its trigger edge time minus the session start T0. Index recovered as `round(PTS / period)`.
+- **Why:** the same code path as with a real camera (camera frames carry a capture time, matched to edges by time); the true edge time also goes into the SEI. Encoder passes timestamps through V4L2 at µs resolution, far finer than the 16-33 ms period.
+- **Alternative:** PTS = `index × period`: exact grid, no rounding, but a test-only path.
+- Identical today (edges computed exactly on the grid); they differ once edge times are measured or a camera is used.
+
+## DL-16 SEI insertion: our own C code now, GStreamer element later
+
+- **Decision:** our code adds one SEI per frame (H.265 "user data unregistered", fixed identifier + version + {session, index, edge time, flags}) to the encoded stream at the `appsink`.
+- **Why:** pure byte handling, unit-testable on the laptop without GStreamer, easy to debug; doesn't depend on whether GStreamer 1.22's encoder and parser carry SEI metadata through (unverified).
+- **Alternative:** GStreamer's SEI metadata on input buffers.
+- **Later:** the same functions become the body of our own GStreamer element (DL-08); only the insertion point moves, parser and checker stay.
+
+## DL-17 Frame index drawn into test frames
+
+- **Decision:** the test source draws each frame's index as a row of large black/white squares (binary); the laptop checker decodes the video, reads them and compares with the SEI index.
+- **Why:** proves each SEI sits on the right frame. A continuity check alone misses an off-by-one shift (every frame carrying its neighbour's SEI is still continuous).
+- **Limit:** test source only; with a camera the equivalent is a visible counter or LED in the scene.
+- **Cost:** ~50 lines each side; large high-contrast squares survive compression.
