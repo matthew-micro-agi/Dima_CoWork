@@ -99,5 +99,6 @@ Each check script also has a `host` mode (laptop only, no board). Board runs pau
 | `dts/` | device-tree overlay (CPTS timestamp loop) |
 | `cmake/` | SDK toolchain file, version stamping |
 | `prereq/` | pre-coding check tools (`testptp` build) |
+| `logs/` | raw working notes of the trial, written along the way with AI assistance and committed as is: bench problems (`0000`), open tasks (`0002`), component notes (`0003`), measurement log with raw results (`0004`), dependencies (`0005`). Not curated and partly outdated: `docs/` is the reference; `logs/` shows how results were reached |
 
 Versions: `0.1.0-g<commit>`, `-dirty` for uncommitted builds; `fwt-doctor dev` shows what the board runs against the checkout.
