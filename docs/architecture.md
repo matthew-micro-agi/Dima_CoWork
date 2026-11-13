@@ -188,6 +188,26 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ### 4.4 Frame-to-trigger matching and drop detection [OURS]
 
+```
+ PTP domain (shared by all nodes)                MONOTONIC domain (this node's Linux)
+ ────────────────────────────────                ────────────────────────────────────
+ grandmaster ──PTP──► ptp4l ──steers──► CPTS clock (PHC, /dev/ptp0)
+                                          │
+                     edge k fired at T0 + k·P (hardware)
+                     its time t captured (HW3_TS_PUSH, G1)
+                                          │
+                     trigd: EDGE {k, t} ──┼──► nodecap: offset = PHC − MONO (read per edge)
+                                          │             edge_mono = t − offset
+                                          │                       │
+ sensor exposes on the edge ── frame ─────┼──► V4L2 driver: t_frame (MONO, end of frame)
+                                          │                       │
+                                          │    bind: |t_frame − (edge_mono + latency)| ≤ 3 ms
+                                          │                       │
+ frame inherits t (PTP) ◄─────────────────┼───────────────────────┘
+   -> PTS = t − T0 through the encoder -> k = PTS / P (2nd check) -> SEI {session, k, t}
+```
+- **Edge time:** PTP clock, captured in hardware. **Frame stamp:** MONOTONIC, set by the driver (now: `cam-emu`). **One conversion:** the edge's PTP time to MONOTONIC, per edge, only to compare. **What the frame keeps:** its edge's PTP time, never its own stamp.
+
 - `trigd` passes `{index, t_edge}` to `nodecap`. The edge event arrives before its frame (exposure + readout come first), so `nodecap` keeps a small list of undecided edges.
 - **Match by time, not by queue position (DL-27, implemented for `emu`):** a frame belongs to the edge whose `t_edge + latency` is nearest, within **± 3 ms** (`--cam-window-ms`; refused at ¼ period or more). Two frames for one edge: the nearer kept, the other spurious. An edge is decided once its window has passed (a later frame arrived, or max(4 periods, 100 ms) without frames).
   - Latency configured (`--cam-latency-ms`, 25 ms); measured min/mean/max reported; warning when frames sit beyond half the window. Measuring it at start: later.
