@@ -24,6 +24,9 @@ add_subdirectory(src/trigd)
 add_subdirectory(src/nodecap)
 add_subdirectory(src/tools/fwt-info)
 add_subdirectory(src/tools/trig-listen)
+if(NOT CMAKE_CROSSCOMPILING)
+  add_subdirectory(src/tools/sei-dump)   # laptop only (uses ffmpeg)
+endif()
 
 # Unit tests run on the laptop only (not when cross-compiling).
 if(NOT CMAKE_CROSSCOMPILING)
