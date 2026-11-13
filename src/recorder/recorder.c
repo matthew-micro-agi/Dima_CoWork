@@ -386,6 +386,24 @@ static uint64_t expected_seg_bytes(const struct recorder *r)
 
 /* ---- segments ------------------------------------------------------------ */
 
+static int64_t mono_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void timed(struct rec_timing *t, int64_t start_ns)
+{
+	int64_t d = mono_ns() - start_ns;
+
+	t->n++;
+	t->total_ns += d;
+	if (d > t->max_ns)
+		t->max_ns = d;
+}
+
 static int close_segment(struct recorder *r)
 {
 	struct rec_record x;
@@ -438,19 +456,33 @@ int rec_write_frame(struct recorder *r, const struct iovec *iov, int iovcnt, int
 	if (!r->active || index < 0)
 		return -EINVAL;
 	/* DL-18: cut at the first keyframe at or after the boundary. */
-	if (r->seg_open && key && index >= r->boundary && (e = close_segment(r)) != 0)
-		return e;
+	int64_t t0;
+
+	if (r->seg_open && key && index >= r->boundary) {
+		t0 = mono_ns();
+		e = close_segment(r);
+		timed(&r->st.t_close, t0);
+		if (e)
+			return e;
+	}
 	if (!r->seg_open) {
 		if (!key) {
 			r->st.skipped_no_key++;
 			return 1;
 		}
-		if ((e = open_segment(r, index, t_ns)) != 0)
+		t0 = mono_ns();
+		e = open_segment(r, index, t_ns);
+		timed(&r->st.t_open, t0);
+		if (e)
 			return e;
 	}
 	/* Keyframe: make the previous complete group durable (crash loses <= 1 group). */
-	if (key && r->cur.bytes > 0 && fdatasync(r->seg_fd) != 0)
-		logf_(r, "fdatasync: %s", strerror(errno));
+	if (key && r->cur.bytes > 0) {
+		t0 = mono_ns();
+		if (fdatasync(r->seg_fd) != 0)
+			logf_(r, "fdatasync: %s", strerror(errno));
+		timed(&r->st.t_keysync, t0);
+	}
 	if (key) {
 		if (r->cur.n_keys < REC_MAX_KEYS) {
 			r->cur.key_off[r->cur.n_keys] = (uint32_t)r->cur.bytes;
@@ -468,9 +500,11 @@ int rec_write_frame(struct recorder *r, const struct iovec *iov, int iovcnt, int
 
 	for (int i = 0; i < iovcnt; i++)
 		want += (ssize_t)iov[i].iov_len;
+	t0 = mono_ns();
 	do {
 		done = writev(r->seg_fd, iov, iovcnt);
 	} while (done < 0 && errno == EINTR);
+	timed(&r->st.t_write, t0);
 	if (done != want) {
 		e = done < 0 ? -errno : -EIO;
 		logf_(r, "write segment: %s", done < 0 ? strerror(errno) : "short write");

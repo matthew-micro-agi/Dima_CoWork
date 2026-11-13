@@ -50,10 +50,20 @@ struct rec_lock {
 	bool active;              /* not unlocked (may still have expired) */
 };
 
+/* Time spent in one kind of storage call (CLOCK_MONOTONIC). */
+struct rec_timing {
+	uint64_t n;
+	int64_t  max_ns, total_ns;
+};
+
 struct rec_stats {
 	uint64_t frames, bytes, segments_closed, segments_deleted, sessions_emptied;
 	uint64_t skipped_no_key, no_room, locks_refused;
 	uint64_t recovered_segments, recovery_dropped_files, torn_bytes_cut, stale_files_removed;
+	/* rec_write_frame's storage calls: frame write, keyframe fdatasync, segment
+	 * close (fsync file + directory, manifest append), segment open (incl. ring
+	 * reclaim) */
+	struct rec_timing t_write, t_keysync, t_close, t_open;
 };
 
 struct recorder {
