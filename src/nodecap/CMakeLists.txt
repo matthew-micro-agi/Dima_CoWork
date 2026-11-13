@@ -1,5 +1,5 @@
 # Pure logic, also used by the laptop unit tests.
-add_library(nodecap_core STATIC nodecap_core.c)
+add_library(nodecap_core STATIC nodecap_core.c nc_source_test.c)
 target_include_directories(nodecap_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodecap_core PUBLIC fwt_common)
 

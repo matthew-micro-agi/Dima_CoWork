@@ -40,16 +40,16 @@
 #include "fwt_seqcheck.h"
 #include "fwt_stamp.h"
 #include "fwt_trig_msg.h"
+#include "nc_source.h"
 #include "nodecap_core.h"
 #include "rec_ctl.h"
 #include "recorder.h"
 
-#define N_PATTERNS   8
 #define SRC_MAX_QUEUED 4  /* frames waiting in appsrc before we drop */
 
 struct opts {
 	const char *sock_path, *enc, *out_path, *log_path, *enc_extra, *level;
-	const char *rec_dir, *ctl_path;
+	const char *rec_dir, *ctl_path, *src_name;
 	uint64_t ring_max_mb;
 	int seg_seconds, lock_cap_pct;
 	int w, h;
@@ -67,7 +67,7 @@ struct stats {
 struct nodecap {
 	struct opts o;
 	GstElement *pipe, *src, *sink;
-	uint8_t *patterns[N_PATTERNS];
+	struct nc_source *cam;  /* frame source (DL-26) */
 	size_t frame_size;
 	struct fwt_stamp_geom geom;
 
@@ -100,6 +100,7 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"usage: %s [options]\n"
 		"  --sock PATH        trigd socket (default %s)\n"
+		"  --src test         frame source: test = built-in, one frame per edge (default)\n"
 		"  --enc v4l2|x265    encoder: Wave5 (board) or software (laptop) (default v4l2)\n"
 		"  --width W --height H   frame size (default 1920x1200)\n"
 		"  --bitrate BPS      target bitrate, bit/s (default 5000000)\n"
@@ -122,6 +123,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 {
 	static const struct option lo[] = {
 		{ "sock", required_argument, NULL, 'S' },
+		{ "src", required_argument, NULL, 'X' },
 		{ "enc", required_argument, NULL, 'e' },
 		{ "width", required_argument, NULL, 'W' },
 		{ "height", required_argument, NULL, 'H' },
@@ -145,11 +147,13 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 
 	*o = (struct opts){ .sock_path = FWT_TRIGD_SOCK_DEFAULT, .enc = "v4l2",
 			    .enc_extra = "", .level = "5", .ctl_path = REC_CTL_SOCK_DEFAULT,
+			    .src_name = "test",
 			    .seg_seconds = 4, .lock_cap_pct = 20,
 			    .w = 1920, .h = 1200, .bitrate = 5000000 };
 	while ((c = getopt_long(argc, argv, "qh", lo, NULL)) != -1) {
 		switch (c) {
 		case 'S': o->sock_path = optarg; break;
+		case 'X': o->src_name = optarg; break;
 		case 'e': o->enc = optarg; break;
 		case 'W': o->w = atoi(optarg); break;
 		case 'H': o->h = atoi(optarg); break;
@@ -168,6 +172,10 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		case 'q': o->quiet = true; break;
 		default: usage(argv[0]); return -1;
 		}
+	}
+	if (strcmp(o->src_name, "test")) {
+		fprintf(stderr, "nodecap: --src must be test\n");
+		return -1;
 	}
 	if (strcmp(o->enc, "v4l2") && strcmp(o->enc, "x265")) {
 		fprintf(stderr, "nodecap: --enc must be v4l2 or x265\n");
@@ -435,14 +443,9 @@ static int start_session(struct nodecap *nc, const struct fwt_trig_msg *m)
 	return build_pipeline(nc);
 }
 
-static void push_edge(struct nodecap *nc, const struct fwt_trig_msg *m)
+/* Push one frame of the source to the encoder, bound to its edge. */
+static void push_frame(struct nodecap *nc, const struct nc_frame *f, const struct fwt_trig_msg *m)
 {
-	if (m->session != nc->session || m->period_ns != nc->period_ns) {
-		fprintf(stderr, "nodecap: edge from another session/period ignored\n");
-		return;
-	}
-	nc->st.edges++;
-
 	struct nc_edge e = { .index = m->index, .t_ns = m->t_ns, .session = m->session,
 			     .flags = m->flags };
 
@@ -452,14 +455,21 @@ static void push_edge(struct nodecap *nc, const struct fwt_trig_msg *m)
 			" dropped\n", m->index);
 		return;
 	}
+	if (f->len != nc->frame_size) {
+		fprintf(stderr, "nodecap: frame of %zu bytes, want %zu: dropped\n", f->len,
+			nc->frame_size);
+		nc->st.dropped_in++;
+		return;
+	}
 
 	GstBuffer *buf = gst_buffer_new_allocate(NULL, nc->frame_size, NULL);
 	GstMapInfo map;
 
 	gst_buffer_map(buf, &map, GST_MAP_WRITE);
-	memcpy(map.data, nc->patterns[(uint64_t)m->index % N_PATTERNS], nc->frame_size);
-	fwt_stamp_draw(map.data, nc->o.w, map.data + (size_t)nc->o.w * nc->o.h, nc->o.w,
-		       nc->o.w, nc->o.h, &nc->geom, (uint32_t)m->index);
+	memcpy(map.data, f->data, nc->frame_size);
+	if (f->draw_stamp)
+		fwt_stamp_draw(map.data, nc->o.w, map.data + (size_t)nc->o.w * nc->o.h, nc->o.w,
+			       nc->o.w, nc->o.h, &nc->geom, f->stamp);
 	gst_buffer_unmap(buf, &map);
 
 	GST_BUFFER_PTS(buf) = (GstClockTime)nc_pts_of(m->t_ns, nc->t0_ns);
@@ -473,6 +483,32 @@ static void push_edge(struct nodecap *nc, const struct fwt_trig_msg *m)
 		fprintf(stderr, "nodecap: push for index %" PRId64 " refused\n", m->index);
 	else
 		nc->st.pushed++;
+}
+
+/* Take every ready frame from the source. */
+static void drain_source(struct nodecap *nc)
+{
+	struct nc_frame f;
+	int r;
+
+	while ((r = nc->cam->ops->dequeue(nc->cam, &f)) == 1) {
+		if (f.has_edge)  /* bound by construction (test source) */
+			push_frame(nc, &f, &f.edge);
+		nc->cam->ops->release(nc->cam, &f);
+	}
+	if (r < 0)
+		fprintf(stderr, "nodecap: frame source %s: %s\n", nc->cam->name, strerror(-r));
+}
+
+static void on_edge(struct nodecap *nc, const struct fwt_trig_msg *m)
+{
+	if (m->session != nc->session || m->period_ns != nc->period_ns) {
+		fprintf(stderr, "nodecap: edge from another session/period ignored\n");
+		return;
+	}
+	nc->st.edges++;
+	nc->cam->ops->on_edge(nc->cam, m);
+	drain_source(nc);
 }
 
 static int send_type(int fd, const struct sockaddr_un *to, uint16_t type)
@@ -518,11 +554,10 @@ static int init_frames(struct nodecap *nc)
 		fprintf(stderr, "nodecap: frame too small for the index stamp\n");
 		return -1;
 	}
-	for (int k = 0; k < N_PATTERNS; k++) {
-		nc->patterns[k] = malloc(nc->frame_size);
-		if (!nc->patterns[k])
-			return -1;
-		nc_testframe_fill(nc->patterns[k], nc->o.w, nc->o.h, k);
+	nc->cam = nc_source_test_new(nc->o.w, nc->o.h);
+	if (!nc->cam) {
+		fprintf(stderr, "nodecap: frame source %s: out of memory\n", nc->o.src_name);
+		return -1;
 	}
 	return 0;
 }
@@ -712,7 +747,7 @@ int main(int argc, char **argv)
 			if (!nc.started && start_session(&nc, &m) != 0)
 				failed = true;
 			else
-				push_edge(&nc, &m);
+				on_edge(&nc, &m);
 		}
 	}
 	if (!ended)
@@ -764,6 +799,7 @@ int main(int argc, char **argv)
 		  (!nc.rec_on || (s->rec_frames == s->frames_out && !s->rec_errors));
 	g_mutex_unlock(&nc.lock);
 
+	nc.cam->ops->destroy(nc.cam);
 	if (nc.out)
 		fclose(nc.out);
 	if (nc.log)
