@@ -248,26 +248,47 @@ cmake --build build-board -j
 |---|---|---|
 | `tests/trigd-check.sh` | `host` | build, unit tests; `trigd` on the system clock + `trig-listen`: 90 edges, gap detection, two subscribers |
 | | `dev <user@node>` | cross-build, copy to `/tmp`; 300 edges on `/dev/ptp0`, stop with SIGINT, output disarmed |
-| `tests/nodecap-check.sh` | `host` | build, unit tests; `trigd` + `nodecap` (x265): 90 frames, gap detection; `sei-dump` on each stream |
+| `tests/nodecap-check.sh` | `host` | build, unit tests; `trigd` + `nodecap` (x265, 960x600): 90 frames, gap detection; `sei-dump` on each stream |
 | | `dev <user@node>` | laptop + board builds; 300 edges on `/dev/ptp0` with Wave5 on the board; stream copied back, `sei-dump` here |
+| `tests/recorder-check.sh` | `host` | build, unit tests; `nodecap --rec` (x265) in temp dirs: record 300 + live lock + `rec-tool verify`; same session refused; `kill -9` + restart recovery; 4 MB ring wrap with a lock in an old session and an oversized lock refused |
+| | `dev <user@node>` | cross-build, copy to `/tmp`; same scenario on the board with Wave5: main run into `/rec`, crash and ring runs in `/rec/check-crash`, `/rec/check-ring` (recreated each run) |
 
 ```sh
 tests/trigd-check.sh host
 tests/nodecap-check.sh dev root@10.42.0.132
 ```
+Laptop runs use 960x600: the laptop's software encoder can't hold 30 fps at 1920x1200 and drops frames. The board runs full resolution.
+
 **Verify:** each ends with `ALL PASSED (<mode>)`. Every step prints PASS/FAIL with the compared values; full logs in the `/tmp/<name>-check.XXXXXX` directory named at the end. Nothing is installed on the board (binaries and output in `/tmp`, a RAM disk).
 
 ### 8.3 Run by hand
+The session number comes from the plan maker (DL-20); in the trial that is you or the script: pick a fresh one per run.
 ```sh
-# board: 300 edges @30 fps on the PTP clock, Wave5, stream + per-frame CSV in /tmp
-/tmp/trigd --count 300 2>/tmp/trigd.log & sleep 0.5; \
+# board: 300 edges @30 fps on the PTP clock, Wave5, one stream + per-frame CSV in /tmp
+S=$((RANDOM * 32768 + RANDOM + 1)); \
+/tmp/trigd --session $S --count 300 2>/tmp/trigd.log & sleep 0.5; \
 /tmp/nodecap --enc v4l2 --out /tmp/nc.h265 --log /tmp/nc.csv -q
+```
+```sh
+# board: record into /rec (segments, manifest, ring), lock a range while recording
+S=$((RANDOM * 32768 + RANDOM + 1)); \
+/tmp/trigd --session $S --count 300 2>/dev/null & sleep 0.5; \
+/tmp/nodecap --enc v4l2 --rec /rec -q & sleep 5; \
+/tmp/rec-tool lock --session $S --from 60 --to 200 --ttl 600 --reason manual; \
+wait
+```
+```sh
+# board: inspect and check /rec
+/tmp/rec-tool list -v      # sessions, segments (LOCKED / DELETED / recovered), locks
+/tmp/rec-tool verify       # manifest vs files vs SEIs; exit code 0 = problems 0
+/tmp/rec-tool unlock --id N
 ```
 ```sh
 # laptop: check a stream (exit code 0 = pass)
 build-host/src/tools/sei-dump/sei-dump -q --frames 300 nc.h265
 ```
-- `trigd --help`, `nodecap --help`: options (clock, fps, T0 offset, count, encoder, bitrate, `--enc-extra` for extra Wave5 controls).
+- `trigd --help`, `nodecap --help`: options (clock, fps, T0 offset, count, encoder, bitrate, level, `--enc-extra` for extra Wave5 controls; recorder: `--rec`, `--ring-max-mb`, `--seg-seconds`, `--lock-cap-pct`, `--ctl-sock`).
+- `rec-tool lock/unlock` go to the running recorder over `/run/fwtrial/rec.sock`; with no recorder running, `rec-tool` opens `/rec` itself.
 - `nodecap` needs `trigd` running first; both stop at `trigd`'s END (`--count`) or Ctrl-C.
 
 Not yet: install paths, systemd units (DL-14), Yocto layer.

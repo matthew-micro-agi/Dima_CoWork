@@ -190,40 +190,45 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ### 5.2 Sessions and segments
 
-- **Session:** assigned at arming (by the controller in the product, shared by all nodes). Index restarts at 0 per session. Statuses: `recording`, `complete`, `truncated`, `interrupted`.
-- **Segment length: 4 s** (DL-07): segment k starts at index k·120 @30 fps (k·240 @60 fps); ~2.5 MB @1080p30, ~5 MB @1080p60.
+- **Session number:** part of the session plan, made by the **single plan maker** (controller in the product; the laptop script or operator in the trial) and the same on every node of a pack. **Nodes never make one** (DL-20): `trigd` requires `--session`; the recorder refuses a number already on disk. Index restarts at 0 per session. Statuses: `recording`, `complete`, `interrupted`; `truncated by ring` when segments were reclaimed.
+- **Segment length: 4 s** (DL-07); ~2.5 MB @1080p30, ~5 MB @1080p60. A segment ends at the **first keyframe at or after** its boundary index (k·120 @30 fps) and is named by its real first index (DL-18): after a dropped frame the encoder's keyframes shift, so a segment may run up to 1 s longer.
 - A new session always starts a new segment; the last segment of a session may be short.
 - A pause between sessions is not a drop; gap detection runs within a session.
 
 ```
 /rec/
-  manifest.bin                 append-only change log (the truth)
-  s0001/000000000.h265         session 1, segment starting at index 0
-  s0001/000000120.h265
-  s0002/000000000.h265         session 2
+  manifest.bin                       append-only change log (the truth)
+  s0534242870/0000000000.h265        session 534242870, segment starting at index 0
+  s0534242870/0000000120.h265
+  s0667108096/0000000000.h265        next session
 ```
 
-- **Write discipline:** flush (`fdatasync`) at every keyframe, so a crash loses at most ~1 s. On segment close: fsync the file, *then* append its manifest record + fsync.
+- **Write discipline:** flush (`fdatasync`) at every keyframe, so a crash loses at most ~1 s. On segment close: fsync the file and its directory, *then* append its manifest record + fsync.
+- **As built:** `src/recorder/`, plain functions inside `nodecap` (`--rec /rec`); frames are handed over without copying (head, SEI, rest). Checked by `tests/recorder-check.sh` on laptop and board.
 
 ### 5.3 Manifest and index
 
-- **Record per segment:** `{session, seg, first_idx, last_idx, t_first, t_last, bytes, keyframe byte offsets, flags (locked_until, gap, offloaded)}`, about 64 B. 24 h = 21,600 segments ≈ 1.4 MB.
+- **Records (DL-19):** fixed 128 bytes: header (magic, version, type, sequence number, session), type-specific body, CRC-32. Types: session start, session end, segment closed, segment deleted, lock, unlock. Segment record: `{first_idx, last_idx, t_first, t_last, bytes, frames, missing, up to 8 keyframe byte offsets + their indices, flags (recovered)}`. Locks are separate records (ranges), not segment flags. 24 h = 21,600 segment records ≈ 2.8 MB.
+- **Torn write:** a record half-written at power loss fails its CRC; loading stops there and the next start cuts the tail off.
 - **The manifest on eMMC is the truth:** every change (segment closed, reclaimed, locked) is appended immediately, then applied in RAM. **The RAM index is a mirror**, loaded once at boot. The manifest is compacted occasionally (new file + atomic rename).
-- **Queries never scan the eMMC:** sessions and segments come from RAM (binary search, ~15 steps for 24 h); fetch reads only the needed files.
-- **One owner:** `recorder` alone owns the index. `nodeagent` asks it over the local socket (session/index/time range -> files + keyframe byte offsets).
+- **Queries never scan the eMMC:** sessions and segments come from RAM; fetch reads only the needed files. As built: linear scans of the RAM arrays (fine at trial scale); binary search over the sorted segment list when needed (~15 steps for 24 h). Manifest compaction: not built yet.
+- **One owner:** the recorder alone owns `/rec` and its index (exclusive `flock` on the manifest; a second recorder is refused).
+- **Control socket** (as built): `/run/fwtrial/rec.sock`, Unix datagram, fixed 120-byte versioned struct (same pattern as the trigger message, DL-11): lock and unlock requests, served by `nodecap` while recording. `rec-tool` uses it; with no recorder running it opens `/rec` itself. `nodeagent` will use the same socket (plus queries: session/index/time range -> files + keyframe byte offsets).
 - No database (SQLite considered and rejected: DL-06).
 
 ### 5.4 Ring and locks
 
 - **The ring is ordinary segment files on ext4 plus a delete rule**, not a special circular area. Large sequential writes and whole-file deletes suit the eMMC's own wear levelling (AC §5).
-- **Before each new segment:** make room for `expected_segment_bytes` (bitrate × 4 s × 1.5) + `reserve_bytes`. Free = min(filesystem free, `ring_max_bytes` − used). A small `ring_max_bytes` (~500 MB) makes the ring wrap within a test run.
+- **Before each new segment:** make room for 1.5 × the expected segment size (the last closed segment; before the first one: bitrate × length) + `reserve_bytes` (64 MB). Free = min(filesystem free, `ring_max_bytes` − used). A small `ring_max_bytes` makes the ring wrap within a test run (`--ring-max-mb`).
 - **Victim order:**
   1. oldest **closed** session, deleted **whole** (its unlocked segments)
   2. oldest unlocked segment of the **running** session
-  3. none -> `storage_full` event (unreachable while the lock cap holds)
+  3. none -> the frame is not recorded and counted (`storage_full` event with `nodeagent`); unreachable while the lock cap holds
 - **Delete order:** manifest "deleted" record + fsync -> unlink file -> update RAM.
 - **Locks:** whole segments, with reason and TTL, recorded in the manifest. A lock can cover a **post-event window**: the past part locks immediately, the future part is applied to segments as they close. A lock is **refused and reported** if locked bytes would exceed `lock_cap` (~20 % of the ring), so the ring can always free space and recording never stops because of locks. Expired locks become reclaimable.
+- **Lock expiry** uses the wall clock (`CLOCK_REALTIME`): it depends on the node's time being set (open item: RTC/NTP on the board).
 - **Truncated sessions** stay listed with their available ranges. A session disappears only when its last segment is gone.
+- **Verified** (laptop and board, 4 MB ring): 900 frames recorded while wrapping, closed session reclaimed first, locked segment survived, oversized lock refused at the cap, disk use under the limit.
 
 ### 5.5 Fetch
 
@@ -240,11 +245,11 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ### 5.6 Reset and recovery
 
-- The eMMC keeps everything. At boot: load the manifest into RAM; check only the **last session's directory** against it:
-  - an unfinished segment is kept up to its last flushed keyframe
-  - a file without a record is indexed from its SEIs
+- The eMMC keeps everything. At start: load the manifest into RAM (cut a torn tail); check the directory of every session without a session-end record (normally only the last one):
+  - a file without a record is indexed from its SEIs; complete keyframe groups are kept (everything before its last keyframe), the rest is cut off; a file without a complete group is removed
   - a "deleted" record whose file still exists -> the file is removed
-- The interrupted session is marked `interrupted`. The node reports a `rebooted` event. **No automatic re-arm**: the controller decides (a node re-arming on its own could diverge from its pack).
+- The session is marked `interrupted`. **No automatic re-arm**: the controller decides (a node re-arming on its own could diverge from its pack). The `rebooted` event comes with `nodeagent`.
+- **Verified** (laptop and board): `kill -9` mid-session -> restart -> open segment rebuilt, session `interrupted`, `rec-tool verify` clean.
 
 ### 5.7 eMMC layout
 
@@ -397,8 +402,8 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 | A2 | `trigd`: CPTS edges + hardware timestamps | no | **v1 done:** hardware edges, computed times (G1) |
 | A3 | Trigger-driven test source | no | **done** (drawn index) |
 | A4 | SEI per frame | no | **done** (+ `sei-dump`) |
-| A5 | Recorder: segments, manifest, ring, locks | no | next |
-| A6 | Query/fetch | no | open |
+| A5 | Recorder: segments, manifest, ring, locks | no | **done** (`src/recorder`, `rec-tool`, `recorder-check.sh`) |
+| A6 | Query/fetch | no | next (with A7) |
 | A7 | `nodeagent` control interface | no | open |
 | A8 | Matching + drop detection | no | **encoder-output check done**; camera-side matching with B |
 | A9 | Node simulator + conformance tests | no | open |
