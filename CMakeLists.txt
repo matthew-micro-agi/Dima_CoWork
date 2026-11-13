@@ -16,8 +16,14 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wshadow -Wformat=2 -Wundef)
 
-configure_file(src/common/fwt_version.h.in
-               ${CMAKE_BINARY_DIR}/generated/fwt_version.h @ONLY)
+# Version header regenerated on every build (git commit may change without
+# re-running CMake): cmake/version.cmake, DL-24.
+add_custom_target(fwt_version ALL
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}
+          -DOUT=${CMAKE_BINARY_DIR}/generated/fwt_version.h
+          -DPROJECT_VERSION=${PROJECT_VERSION} -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/fwt_version.h
+  COMMENT "version header")
 
 add_subdirectory(src/common)
 add_subdirectory(src/trigd)
