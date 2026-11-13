@@ -500,13 +500,25 @@ ssh root@10.42.0.132 \
 
 **Check scripts and the installed service:** board runs (`tests/*-check.sh dev`) pause `fwtrial-nodeagent` for the run (same port, sockets, `/rec`) and start it again at the end, also on failure.
 
-**Remove completely** (recordings in `/rec` stay):
+**Uninstall** (everything of ours except `/rec`):
 ```sh
-ssh root@10.42.0.132 \
-  'systemctl disable --now fwtrial-nodeagent fwtrial-ptp4l; \
-   rm -f /etc/systemd/system/fwtrial-*.service; systemctl daemon-reload; \
-   rm -rf /opt/fwtrial /etc/fwtrial /var/log/fwtrial'
+cd ~/Dima_CoWork && \
+deploy/deploy.sh root@10.42.0.132 --uninstall
 ```
+On the node itself: `sh /opt/fwtrial/current/install.sh --uninstall`. `deploy.sh` copies this checkout's `install.sh` to the node and runs it, so it works whatever version (or nothing) is installed.
+- **Refused while a session runs** (a `trigd` or `nodecap` process: an armed session or a check script); it names the processes. End the session (disarm, or let the check finish), then retry. An idle `nodeagent` is just stopped.
+- **Removes:** both services (stopped, disabled; trigger output disarmed), their unit files and `systemctl edit` drop-ins, `/opt/fwtrial` (all releases), `/etc/fwtrial` (configs, including local edits), `/var/log/fwtrial`, `/run/fwtrial`; then checks nothing is left.
+- **Keeps:** `/rec`. Wiping recordings is the separate eMMC procedure (§6).
+- Nothing installed: says so, exit code 0.
+
+**Expected end:**
+```
+uninstall: fwtrial 0.1.0-g<commit>
+  removed: fwtrial-ptp4l.service fwtrial-nodeagent.service (+ drop-ins), /opt/fwtrial, /etc/fwtrial, /var/log/fwtrial, /run/fwtrial
+  kept:    /rec (recordings)
+uninstalled (install again: deploy/deploy.sh <user@node>)
+```
+Verified: refusal with a session running; uninstall left no unit, path, boot link or process, port 8080 closed, `/rec` listing unchanged; reinstall wrote fresh default configs and listed the old recordings; services back after a reboot.
 
 Not yet: Yocto layer (`meta-fwtrial`), signed bundles.
 

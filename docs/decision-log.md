@@ -208,6 +208,7 @@ All dates 2026-11-12.
 - **Why:** a newcomer goes from checkout to a running service with one command; reboot-safe; release + symlink gives rollback, the same idea as the product's A/B update; reuses CMake's install rules.
 - **Alternatives:** `opkg` package (the image has opkg; needs packaging metadata and a feed); Yocto image now (product path, architecture §9; too much for the trial); copying into `/usr/local` (no rollback, hard to clean up).
 - **Check scripts:** board runs stop the installed service first and start it again afterwards (they use the same port, sockets and `/rec`).
+- **Uninstall:** `install.sh --uninstall` (or `deploy.sh <node> --uninstall`) removes everything of ours except `/rec`, configs included: the expected meaning of "uninstall"; a clean reinstall starts from the defaults. Refused while `trigd` or `nodecap` runs, so a recording is never cut off by it.
 - **Later:** Yocto recipe in `meta-fwtrial` installing the same units and configs; signed bundles.
 
 ## DL-25 PTP on the node as a systemd service
