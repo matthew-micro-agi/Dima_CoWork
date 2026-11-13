@@ -3,7 +3,7 @@
 Firmware for one camera node of a synchronised multi-camera recorder, built on a TI J722S EVM in a two-day trial. A trigger edge, generated and timestamped in hardware on PTP time, starts every frame; each frame is encoded in H.265 on the SoC's Wave5 encoder, carries its trigger index and edge time inside the stream, and is recorded to the eMMC as a ring of segment files with a manifest. A control interface (HTTP + CBOR, contract in CDDL) arms sessions, locks ranges and serves recordings.
 
 **Start here:**
-- **`docs/summary.md`**: what works, what doesn't, what was skipped and why, what next (30-minute read).
+- **`docs/summary.md`**: summary: what works, what doesn't, what was skipped and why, what next.
 - **`docs/numbers.md`**: every measured number, how it was measured, how to repeat it.
 - **`docs/architecture.md`**: the design; §1 opens with the backbone (one PTP time base -> one plan -> edges in hardware -> frame bound to its edge -> index in every frame).
 - **`docs/decision-log.md`**: choices, alternatives, reasons, dead ends (DL-01 ...).

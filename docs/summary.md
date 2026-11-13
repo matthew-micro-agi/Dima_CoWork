@@ -1,6 +1,6 @@
-# Summary (30-minute read)
+# Summary
 
-Two-day firmware trial on a TI J722S EVM: one recording node of a hardware-synchronised multi-camera recorder. Numbers: `numbers.md`. Design: `architecture.md`. Reasons and dead ends: `decision-log.md`. Reproduce: `README.md` -> `setup.md`.
+Two-day firmware trial on a TI J722S EVM: one recording node of a hardware-synchronised multi-camera recorder. Numbers: `numbers.md`. Design: `architecture.md`. Testing: §3 below. Reasons and dead ends: `decision-log.md`. Reproduce: `README.md` -> `setup.md`.
 
 ## 1. The idea in one chain
 
@@ -15,9 +15,24 @@ One PTP time base on every node -> one plan `{session, T0, P}` to all nodes -> e
 - **Binding by time:** frames bound to edges by timestamp with a ±3 ms window; under injected faults (drop, extra, late, sequence jumps) every count matched and no frame got a wrong index.
 - **Recorder:** 4 s segments, append-only manifest with CRC, ring, locks with a cap, crash recovery; "last 90 s" (~113 MB) fetched in ~1 s with the first byte in ~2 ms while recording and reclaiming.
 - **Control interface:** HTTP + CBOR, the contract in CDDL (`icd/fwt-icd-v1.cddl`), C code generated with zcbor; a C client `fwt-rec` (record, status, fetch, check) that is also the start of the controller code.
-- **Operations:** one-command deploy with rollback and uninstall, systemd services, a host bundle for operators (no build tools), read-only pre-checks (`fwt-doctor`), end-to-end checks per component on laptop and board.
+- **Operations:** one-command deploy with rollback and uninstall, systemd services, a host bundle for operators (no build tools); see §3.
 
-## 3. What doesn't work, or isn't shown
+## 3. How it's tested and integrated
+
+Every component can be tested alone, on the laptop and on the board, with one command each, by anyone; a failure names its cause. This is what found most of the real problems (§6) before a camera existed.
+
+| Layer | What it covers | How it runs |
+|---|---|---|
+| **Unit tests** (11 suites, `ctest`) | pure logic: trigger index and edge tracking, whole-tick periods, frame-to-edge binding (every fault case), write queue (threaded), recorder (manifest CRC, recovery, ring, locks), fetch planning, SEI and drawn index, emulator logic and protocol, the C client against messages written by an independent CBOR library | laptop, < 1 s |
+| **End-to-end checks per component** (`tests/<component>-check.sh host\|dev`) | `trigd` (edges, measured times, fallback, interval = period, stop and `kill -9` disarm); `nodecap` (encode, SEI, decoded index check, level); `recorder` (record, live lock, verify, `kill -9` + recovery, ring wrap, lock cap); `nodeagent` (the whole ICD over HTTP + CBOR, fetch -> decode check, error replies, a `fwt-rec` recording); `camemu` (binding against ground truth, injected faults, window refusal, jitter warning, emulator killed, every frame stored on the eMMC) | `host`: laptop (system clock, software encoder); `dev`: cross-build, copy to the board, real CPTS / Wave5 / eMMC, installed service paused and restarted |
+| **Camera emulator** (`cam-emu`, tests only) | a separate process playing a triggered sensor behind a V4L2-like buffer protocol (format, shared-memory buffers, queue/dequeue, frames lost when no buffer is queued), driven by the same trigger edges; latency, jitter and faults (drop, extra, late, sequence jump); draws each frame's **true index** into the picture, so every run is checked against ground truth | in the checks and the soaks; a stand-in for the missing camera that tests the code path a camera will use |
+| **Pre-checks** (`tools/fwt-doctor host \| host-dev \| dev`) | operator laptop, developer laptop (libraries, venv, TI SDK), link, board (CPTS loop, encoder, `/rec`, installed version vs checkout, services, PTP state); read-only, each problem with its fix | by hand, and at the start of every check script (stops early on a FAIL) |
+| **Deployment** (`deploy/`) | node bundle -> copy -> install (release directories, atomic switch, systemd) -> version check; rollback, status, uninstall; host bundle for operators (deploy + record + check, no build tools); version = commit (`-dirty` warned) | verified on the board: deploy, reboot, rollback, uninstall, reinstall, from the host bundle |
+| **Soak tooling** | `fwt-rec` as the client, a sampler on the board (CPU, memory, temperature, eMMC), a drop watchdog, timed fetches during the run | the two 30-min runs behind `numbers.md` |
+
+What the tests found: the storage stall (soak 1 + timing counters), the start-up ordering bug and the encoder start-up limit (`camemu-check` with the recorder), the odd-period drift (interval statistics in `trigd-check`), the edge drift under PTP correction (soak 2 with measured edges), the binding window (`camemu-check` with faults).
+
+## 4. What doesn't work, or isn't shown
 
 | Item | State | Consequence |
 |---|---|---|
@@ -30,7 +45,7 @@ One PTP time base on every node -> one plan `{session, T0, P}` to all nodes -> e
 | **Events, configure endpoint, conformance suite** | designed, not built | ICD v1 covers arm, disarm, health, sessions, segments, fetch, lock |
 | **Security** (G5) | the bench is open: root SSH without a password, control interface without authentication, recordings unencrypted, bundles unsigned, debug ports open | bench / closed lab network only; a security track is planned (threat model first) |
 
-## 4. What I skipped, and why
+## 5. What I skipped, and why
 
 - **Second node, logic analyzer:** scope decision on day 1: one reliable node with numbers beats a broad demo; multi-node stays described.
 - **Camera bring-up beyond diagnosis:** blocked by hardware (G3); the camera emulator (`cam-emu`) let the whole path be tested, including the timing logic a camera needs, instead of waiting.
@@ -38,7 +53,7 @@ One PTP time base on every node -> one plan `{session, T0, P}` to all nodes -> e
 - **Supervisor MCU and controller firmware:** design only (architecture §7); the C client's protocol layer is written to carry over.
 - **Driver work** (CPTS patch, sensor driver): the board's kernel differs from the SDK's (6.12.17 vs 6.12.57), so kernel modules need a matching build or a new image; left for camera bring-up.
 
-## 5. Found on the way (the useful surprises)
+## 6. Found on the way (the useful surprises)
 
 | Finding | Effect |
 |---|---|
@@ -50,7 +65,7 @@ One PTP time base on every node -> one plan `{session, T0, P}` to all nodes -> e
 | The trigger output doesn't follow PTP's frequency correction (G4) | driver patch planned |
 | Emulator rendering cost more than a 60 fps period on the A53; first-touch page faults delayed the first frames | pre-rendered frames, buffers touched at allocation |
 
-## 6. Positions on the Architecture Context
+## 7. Positions on the Architecture Context
 
 Details in architecture §11.4 and §11.5. In short:
 - **Changed:** recordings are fetched by the PC directly from the nodes, not through the controller.
@@ -58,7 +73,7 @@ Details in architecture §11.4 and §11.5. In short:
 - **Kept, verified:** no supervisor MCU on the standard tier: the J722S CPTS generates and timestamps the trigger itself (with G4 to fix in its driver).
 - **Proposed:** sync budget of at most 50 µs camera-to-camera; open, with the other TBDs in §11.4.
 
-## 7. What next, in order
+## 8. What next, in order
 
 From architecture §11.2; each step unblocks the next.
 1. **Real camera chain:** CPTS driver patch (G4) and a 30-min PTP-locked rerun; trigger to the connector pin + logic analyzer; sensor driver, overlay, ISP; binding calibrated on the camera (latency spread, window, sensor frame counter).
