@@ -252,6 +252,8 @@ cmake --build build-board -j
 | | `dev <user@node>` | laptop + board builds; 300 edges on `/dev/ptp0` with Wave5 on the board; stream copied back, `sei-dump` here |
 | `tests/recorder-check.sh` | `host` | build, unit tests; `nodecap --rec` (x265) in temp dirs: record 300 + live lock + `rec-tool verify`; same session refused; `kill -9` + restart recovery; 4 MB ring wrap with a lock in an old session and an oversized lock refused |
 | | `dev <user@node>` | cross-build, copy to `/tmp`; same scenario on the board with Wave5: main run into `/rec`, crash and ring runs in `/rec/check-crash`, `/rec/check-ring` (recreated each run) |
+| `tests/nodeagent-check.sh` | `host` | build, unit tests; `nodeagent` on port 18080 (temp recordings, system clock, x265 960x600), driven with `curl` + `tools/icd-json`: identity, arm (+ busy), lock and health while recording, fetch while recording, disarm, sessions, segments, fetch last 5 s and whole session -> `sei-dump`, unlock, error replies |
+| | `dev <user@node>` | laptop + board builds; `nodeagent` started on the board (port 8080, `/rec`, Wave5, PTP clock); same scenario over the network; `nodeagent` stopped at the end |
 
 ```sh
 tests/trigd-check.sh host
@@ -290,6 +292,43 @@ build-host/src/tools/sei-dump/sei-dump -q --frames 300 nc.h265
 - `trigd --help`, `nodecap --help`: options (clock, fps, T0 offset, count, encoder, bitrate, level, `--enc-extra` for extra Wave5 controls; recorder: `--rec`, `--ring-max-mb`, `--seg-seconds`, `--lock-cap-pct`, `--ctl-sock`).
 - `rec-tool lock/unlock` go to the running recorder over `/run/fwtrial/rec.sock`; with no recorder running, `rec-tool` opens `/rec` itself.
 - `nodecap` needs `trigd` running first; both stop at `trigd`'s END (`--count`) or Ctrl-C.
+
+### 8.4 Control interface (nodeagent)
+
+`nodeagent` is the node's only long-running process (DL-23): HTTP + CBOR per `icd/fwt-icd-v1.cddl`; it starts `trigd` + `nodecap` per armed session (children's logs in `/tmp`).
+```sh
+# board: start (defaults: port 8080, /rec, /tmp/trigd, /tmp/nodecap, Wave5, /dev/ptp0)
+ssh root@10.42.0.132 \
+  'nohup /tmp/nodeagent >/tmp/nodeagent.log 2>&1 </dev/null &'
+```
+```sh
+# board: stop (an armed session is disarmed first)
+ssh root@10.42.0.132 'pkill -INT -x nodeagent'
+```
+From the laptop: `curl` for HTTP, `tools/icd-json` for CBOR <-> JSON (laptop only, venv). Request keys in the ICD's order.
+```sh
+J="$HOME/Dima_CoWork/.venv/bin/python -I $HOME/Dima_CoWork/tools/icd-json"; \
+U=http://10.42.0.132:8080/v1; \
+curl -s $U/identity | $J to-json; \
+curl -s $U/health | $J to-json
+```
+```sh
+# arm session S at 30 fps (T0 chosen by the node: single node only), record, disarm
+$J to-cbor '{"session": 12345, "fps": 30}' | \
+  curl -s -X POST -H 'Content-Type: application/cbor' --data-binary @- $U/arm | $J to-json
+curl -s -X POST $U/disarm | $J to-json
+```
+```sh
+# list, lock, fetch (raw H.265; X-Fwt-* headers: actual range, missing ranges, open segment)
+curl -s $U/sessions | $J to-json
+curl -s "$U/segments?session=12345" | $J to-json
+$J to-cbor '{"session": 12345, "from_idx": 0, "to_idx": 300, "ttl_s": 3600, "reason": "event"}' | \
+  curl -s -X POST --data-binary @- $U/lock | $J to-json
+curl -s -D - -o last10.h265 "$U/fetch?session=12345&last_s=10" | grep X-Fwt
+build-host/src/tools/sei-dump/sei-dump -q last10.h265
+```
+- Laptop run: see `tests/nodeagent-check.sh` (`run_host`) for the options (`--trigd-args "--clock sys"`, `--nodecap-args "--enc x265 ..."`, `--ptp none`, temp sockets).
+- After an ICD change: `src/nodeagent/gen.sh` regenerates the C code (laptop venv), then rebuild.
 
 Not yet: install paths, systemd units (DL-14), Yocto layer.
 

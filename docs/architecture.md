@@ -180,7 +180,7 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 |---|---|---|
 | `trigd` | C | arms CPTS GENF at T0, reads HW_TS_PUSH events, computes indices, publishes `{index, t_edge}`. **v1 done:** computed edge times until G1 is closed |
 | `nodecap` + `recorder` | C, **one process** | GStreamer pipeline (elements [TI]); matching, drop detection, SEI insertion; segments, manifest, ring, locks (separate module) |
-| `nodeagent` | C | control interface (§6) on `libmicrohttpd`, segment fetch |
+| `nodeagent` | C | control interface (§6) on `libmicrohttpd`, segment fetch. **v1 done:** the only long-running process; starts `trigd` + `nodecap` per session (DL-23) |
 | `ptp4l`, `phc2sys` | linuxptp | time |
 
 - Each runs as a systemd service with restart. Health goes over a local socket to `nodeagent`.
@@ -278,7 +278,7 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ## 6. Control interface
 
-Full spec: `docs/icd.md` (**TBD**), machine-checkable: CDDL schema per message + state machine + conformance tests.
+**Contract:** `icd/fwt-icd-v1.cddl` (CDDL, ICD version 1): every message, the endpoint list and the rules (version field, key order, units). Implemented by `nodeagent` (`src/nodeagent/`), checked by `tests/nodeagent-check.sh` on laptop and board.
 
 - **Transport (trial): HTTP** on `libmicrohttpd`, versioned (`/v1/…`, an `icd` version field in every message; minor = additive only).
 - **Encoding: CBOR** (RFC 8949), `Content-Type: application/cbor`. **The node speaks CBOR only.**
@@ -291,15 +291,25 @@ Full spec: `docs/icd.md` (**TBD**), machine-checkable: CDDL schema per message +
 
 Why CBOR/CDDL/zcbor and HTTP/CoAP, and what was rejected: DL-03, DL-04.
 
-| Group | Endpoints / content |
-|---|---|
-| Identity | node id, versions, capabilities |
-| Configure | fps (sets the trigger period), exposure, gain, WB, bitrate, trigger source |
-| Session | arm `{session, T0, period}`, disarm, start/stop |
-| Storage | `GET /v1/sessions`, `GET /v1/segments`, `GET /v1/fetch`, `POST /v1/lock`, `POST /v1/unlock` |
-| Time | PHC time, PTP offset, last index |
-| Health | ring used/free/depth in hours, locked bytes, eMMC life, drops/gaps/spurious, temperature, link |
-| Events | drop, trigger lost, storage nearly full, lock refused, rebooted |
+| Group | Endpoints / content | v1 status |
+|---|---|---|
+| Identity | `GET /v1/identity`: node id, software version, ICD version, fps range, max resolution | **built** |
+| Session | `POST /v1/arm {session, fps, t0?}` -> `{session, t0, period}`; `POST /v1/disarm`. One session at a time (409 `busy`); reused session number refused (409 `session-exists`, DL-20). `nodeagent` starts `trigd` + `nodecap` per session (DL-23) | **built** |
+| Storage | `GET /v1/sessions[?after=]`, `GET /v1/segments?session=[&from_idx=]` (pages of 512), `POST /v1/lock`, `POST /v1/unlock`, `GET /v1/fetch` | **built** |
+| Health | `GET /v1/health`: state (idle/recording/failed + message), ring used/locked/free, depth in seconds at the measured bitrate, eMMC wear + pre-EOL, frames/missing of the session, SoC temperature, PHC time, `time_verified` | **built** (`time_verified` always false: DL-13) |
+| Configure | exposure, gain, WB, bitrate, trigger source | deferred (needs a camera) |
+| Time | PTP offset, lock state | deferred (DL-13) |
+| Events | drop, trigger lost, storage nearly full, lock refused, rebooted | deferred (SSE or CoAP) |
+
+**As built (v1):**
+- **Fetch** `GET /v1/fetch?session=S&from_idx=I[&to_idx=J]` or `&last_s=N`: raw H.265 (`video/H265`), streamed from the segment files, starting at the first keyframe at or after the requested start. Headers: `X-Fwt-From` / `X-Fwt-To` (actual range), `X-Fwt-Missing` (requested but not returned: before the keyframe, drops between segments, reclaimed segments, not yet closed), `X-Fwt-Missing-Inside` (frames missing inside returned segments), `X-Fwt-Open-Segment` (`not-included` while recording). At most 600 s per request.
+- **Reads are read-only** on `/rec` and answer immediately with the last known good state (DL-22); the running session's open segment (at most 4 s) is not included yet.
+- **Locks** go to the running recorder over its control socket, else `nodeagent` opens `/rec` itself.
+- **Errors:** HTTP status + CBOR `{icd, code, message}` (`bad-request`, `busy`, `session-exists`, `not-armed`, `no-data`, `no-session`, `no-lock`, `lock-cap`, `range-too-long`, `gone`, `not-found`).
+- **Safety:** GET never changes state; strict query parsing; CBOR bodies decoded by the generated code (anything not in the schema is rejected); body limit 4 KB; at most 4 fetches at a time, 16 connections, 30 s connection timeout; a segment opened for fetch stays readable if the ring deletes it.
+- **Key order:** the generated decoder expects map keys in the CDDL order; clients send requests in that order.
+- **Laptop:** `curl` + `tools/icd-json` (CBOR <-> JSON, Python, laptop only).
+- **Not built yet:** authentication (closed bench network; product: needed), HTTP range requests, the open segment in fetch, events, configure, CoAP, the node simulator and conformance suite.
 
 **Failure behaviour:**
 - Controller lost: keep recording, queue events.
@@ -403,8 +413,8 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 | A3 | Trigger-driven test source | no | **done** (drawn index) |
 | A4 | SEI per frame | no | **done** (+ `sei-dump`) |
 | A5 | Recorder: segments, manifest, ring, locks | no | **done** (`src/recorder`, `rec-tool`, `recorder-check.sh`) |
-| A6 | Query/fetch | no | next (with A7) |
-| A7 | `nodeagent` control interface | no | open |
+| A6 | Query/fetch | no | **done** (sessions, segments, keyframe-aligned fetch) |
+| A7 | `nodeagent` control interface | no | **done** (HTTP + CBOR, ICD v1; events and configure deferred) |
 | A8 | Matching + drop detection | no | **encoder-output check done**; camera-side matching with B |
 | A9 | Node simulator + conformance tests | no | open |
 | A10 | Soak and fault tests | no | open; check scripts exist (`tests/*-check.sh`) |
