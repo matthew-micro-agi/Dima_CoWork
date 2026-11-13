@@ -31,14 +31,14 @@ run_host() {
 	L="$B/src/tools/trig-listen/trig-listen"
 
 	echo "== host: 90 edges, system clock, one listener"
-	"$T" --clock sys --sock "$S" --fps 30 --count 90 --t0-offset-ms 500 2>"$LOG/h1-trigd.log" &
+	"$T" --session "$(new_session)" --clock sys --sock "$S" --fps 30 --count 90 --t0-offset-ms 500 2>"$LOG/h1-trigd.log" &
 	sleep 0.3
 	"$L" --sock "$S" -q >"$LOG/h1-listen.log" 2>&1
 	wait
 	check_listen "host 90 edges" "$LOG/h1-listen.log" 90 0
 
 	echo "== host: gap detection (every 10th edge withheld)"
-	"$T" --clock sys --sock "$S" --count 60 --t0-offset-ms 500 --test-skip 10 2>"$LOG/h2-trigd.log" &
+	"$T" --session "$(new_session)" --clock sys --sock "$S" --count 60 --t0-offset-ms 500 --test-skip 10 2>"$LOG/h2-trigd.log" &
 	sleep 0.3
 	"$L" --sock "$S" -q >"$LOG/h2-listen.log" 2>&1
 	local rc=$?
@@ -48,7 +48,7 @@ run_host() {
 		fail "host gap detection: listener exit code $rc, want 1"
 
 	echo "== host: two subscribers"
-	"$T" --clock sys --sock "$S" --count 60 --t0-offset-ms 500 2>"$LOG/h3-trigd.log" &
+	"$T" --session "$(new_session)" --clock sys --sock "$S" --count 60 --t0-offset-ms 500 2>"$LOG/h3-trigd.log" &
 	sleep 0.3
 	"$L" --sock "$S" -q >"$LOG/h3-listen-a.log" 2>&1 &
 	"$L" --sock "$S" -q >"$LOG/h3-listen-b.log" 2>&1 &
@@ -69,7 +69,7 @@ run_dev() {
 
 	echo "== board: 300 edges on the PTP clock, periodic output armed"
 	ssh -o BatchMode=yes "$NODE" \
-		'/tmp/trigd --count 300 2>/tmp/trigd-check-1.log & sleep 0.5; \
+		'/tmp/trigd --session '"$(new_session)"' --count 300 2>/tmp/trigd-check-1.log & sleep 0.5; \
 		 /tmp/trig-listen -q 2>&1; wait; cat /tmp/trigd-check-1.log' >"$LOG/d1.log" 2>&1
 	check_listen "board 300 edges" "$LOG/d1.log" 300 0
 	grep -q "clock /dev/ptp0" "$LOG/d1.log" && grep -q "output disarmed" "$LOG/d1.log" &&
@@ -78,7 +78,7 @@ run_dev() {
 
 	echo "== board: stop with SIGINT mid-session"
 	ssh -o BatchMode=yes "$NODE" \
-		'/tmp/trigd 2>/tmp/trigd-check-2.log & TP=$!; sleep 0.5; \
+		'/tmp/trigd --session '"$(new_session)"' 2>/tmp/trigd-check-2.log & TP=$!; sleep 0.5; \
 		 timeout 20 /tmp/trig-listen -q 2>&1 & LP=$!; sleep 4.5; \
 		 kill -INT $TP; wait $TP; echo "trigd rc=$?"; wait $LP; cat /tmp/trigd-check-2.log' \
 		>"$LOG/d2.log" 2>&1

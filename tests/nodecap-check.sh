@@ -18,6 +18,10 @@ NAME=nodecap-check
 
 B="$ROOT/build-host/src"
 SEI_DUMP="$B/tools/sei-dump/sei-dump"
+# Laptop runs at 960x600: x265 (software) at 1920x1200 can't hold 30 fps on the
+# laptop and drops frames (measurement log, encoder entry). The board runs full
+# resolution on Wave5.
+HOST_SIZE="--width 960 --height 600"
 
 usage() {
 	echo "usage: $0 host | dev <user@node>" >&2
@@ -38,10 +42,10 @@ check_stream() {
 run_host() {
 	local T="$B/trigd/trigd" N="$B/nodecap/nodecap" S="$LOG/trigd.sock" rc
 
-	echo "== host: 90 edges, system clock, x265"
-	"$T" --clock sys --sock "$S" --fps 30 --count 90 --t0-offset-ms 800 2>"$LOG/h1-trigd.log" &
+	echo "== host: 90 edges, system clock, x265 960x600"
+	"$T" --session "$(new_session)" --clock sys --sock "$S" --fps 30 --count 90 --t0-offset-ms 800 2>"$LOG/h1-trigd.log" &
 	sleep 0.3
-	"$N" --enc x265 --sock "$S" --out "$LOG/h1.h265" --log "$LOG/h1.csv" -q \
+	"$N" --enc x265 $HOST_SIZE --sock "$S" --out "$LOG/h1.h265" --log "$LOG/h1.csv" -q \
 		>"$LOG/h1-nodecap.log" 2>&1
 	rc=$?
 	wait
@@ -51,10 +55,10 @@ run_host() {
 	check_stream host "$LOG/h1.h265" 90 0 0
 
 	echo "== host: gap detection (every 10th edge withheld)"
-	"$T" --clock sys --sock "$S" --count 60 --t0-offset-ms 800 --test-skip 10 \
+	"$T" --session "$(new_session)" --clock sys --sock "$S" --count 60 --t0-offset-ms 800 --test-skip 10 \
 		2>"$LOG/h2-trigd.log" &
 	sleep 0.3
-	"$N" --enc x265 --sock "$S" --out "$LOG/h2.h265" -q >"$LOG/h2-nodecap.log" 2>&1
+	"$N" --enc x265 $HOST_SIZE --sock "$S" --out "$LOG/h2.h265" -q >"$LOG/h2-nodecap.log" 2>&1
 	rc=$?
 	wait
 	# 6 edges withheld (9, 19, ..., 59); the last one is only visible via trigd's END.
@@ -74,7 +78,7 @@ run_dev() {
 	echo "== board: 300 edges on the PTP clock, Wave5"
 	ssh -o BatchMode=yes "$NODE" \
 		'rm -f /tmp/nc-check.h265 /tmp/nc-check.csv; \
-		 /tmp/trigd --count 300 2>/tmp/nc-check-trigd.log & sleep 0.5; \
+		 /tmp/trigd --session '"$(new_session)"' --count 300 2>/tmp/nc-check-trigd.log & sleep 0.5; \
 		 /tmp/nodecap --enc v4l2 --out /tmp/nc-check.h265 --log /tmp/nc-check.csv -q; \
 		 echo "nodecap rc=$?"; wait; cat /tmp/nc-check-trigd.log' >"$D/d1.log" 2>&1
 	expect_fields "board nodecap" "$D/d1.log" edges=300 frames=300 dropped=0 gaps=0 unmatched=0

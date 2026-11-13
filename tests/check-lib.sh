@@ -5,6 +5,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAILS=0
 LOG=$(mktemp -d "/tmp/${NAME:-check}.XXXXXX")
 
+# new_session: a random session number (> 0). The laptop is the plan maker in
+# the trial (DL-20): one number per run, passed to every node.
+new_session() {
+	echo $(( ((RANDOM << 16) | RANDOM) % 2147483647 + 1 ))
+}
+
 pass() { echo "PASS  $1"; }
 fail() { echo "FAIL  $1"; FAILS=$((FAILS + 1)); }
 

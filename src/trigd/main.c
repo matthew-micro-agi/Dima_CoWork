@@ -66,7 +66,7 @@ static void usage(const char *prog)
 		"  --clock phc|sys     schedule on the PTP clock (default) or the system\n"
 		"                      clock (laptop test: no hardware, no periodic output)\n"
 		"  --perout N          CPTS periodic output index (default 1)\n"
-		"  --session N         session number (default 1)\n"
+		"  --session N         session number, from the plan maker (required, > 0; DL-20)\n"
 		"  --fps N             frame rate (default 30); period = 1e9/N ns\n"
 		"  --period-ns N       period in ns (overrides --fps)\n"
 		"  --t0 NS             T0 in ns on the clock (default: next whole second + offset)\n"
@@ -97,7 +97,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	};
 	int c;
 
-	*o = (struct opts){ .dev = "/dev/ptp0", .perout = 1, .session = 1,
+	*o = (struct opts){ .dev = "/dev/ptp0", .perout = 1, .session = 0,
 			    .period_ns = trigd_period_from_fps(30),
 			    .t0_offset_ns = NSEC_PER_SEC,
 			    .sock_path = FWT_TRIGD_SOCK_DEFAULT };
@@ -126,6 +126,12 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	}
 	if (o->period_ns <= 0 || o->count < 0 || o->test_skip < 0)
 		return -1;
+	if (o->session == 0) {
+		/* The session number comes with the plan, never made up here (DL-20). */
+		fprintf(stderr, "trigd: --session N (> 0) is required: the plan maker "
+			"(controller, or the laptop in the trial) assigns it\n");
+		return -1;
+	}
 	return 0;
 }
 
