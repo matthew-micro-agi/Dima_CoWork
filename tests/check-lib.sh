@@ -39,7 +39,22 @@ expect_rc() {
 	[ "$2" -eq "$3" ] && pass "$1: exit code $2" || fail "$1: exit code $2, want $3"
 }
 
+# doctor <groups> [node]: tools/fwt-doctor before a run; on a FAIL show its
+# findings (what is missing, how to fix it) and stop here, not mid-run.
+doctor() {
+	local out
+	if out=$(FWT_DOCTOR_QUIET=1 "$ROOT/tools/fwt-doctor" --only "$1" ${2:-} 2>&1); then
+		pass "pre-check ($1)${out:+ (with warnings, below)}"
+		[ -z "$out" ] || echo "$out" | grep -v '^fwt-doctor:' | sed '/^$/d; s/^/      /'
+		return 0
+	fi
+	fail "pre-check ($1): fix these first"
+	echo "$out" | grep -v '^fwt-doctor:' | sed '/^$/d; s/^/      /'
+	finish "${MODE:-check}"
+}
+
 build_host() {
+	doctor tools,build
 	echo "== host build + unit tests"
 	cmake -S "$ROOT" -B "$ROOT/build-host" >"$LOG/cmake-host.log" 2>&1 &&
 		cmake --build "$ROOT/build-host" -j >>"$LOG/cmake-host.log" 2>&1 ||
@@ -57,6 +72,7 @@ build_host() {
 }
 
 build_dev() {
+	doctor sdk
 	echo "== board cross-build"
 	cmake -S "$ROOT" -B "$ROOT/build-board" -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/j722s-sdk.cmake" \
 		>"$LOG/cmake-board.log" 2>&1 &&
@@ -73,6 +89,7 @@ SVC=fwtrial-nodeagent.service
 SVC_NODE=""
 
 svc_pause() {
+	doctor link,node "$1"  # first step that touches the board
 	SVC_NODE=$1
 	if ssh -o BatchMode=yes "$SVC_NODE" "systemctl is-active --quiet $SVC"; then
 		ssh -o BatchMode=yes "$SVC_NODE" "systemctl stop $SVC" &&

@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# fwt-doctor: read-only checks of the machines involved; says what is missing
+# and how to fix it. Changes nothing (no installs, no starts or stops).
+#
+#   tools/fwt-doctor host [user@node]        operator laptop: deploy, record (fwt-rec), check
+#   tools/fwt-doctor host-dev [user@node]    developer laptop: the above + build (laptop, venv, TI SDK)
+#   tools/fwt-doctor dev user@node           the board
+#
+#   --only SEL   comma list instead of a mode's set (used by tests/*-check.sh):
+#                   tools bins build sdk link node
+#
+# Per check: OK / WARN (works, but not as expected) / FAIL (won't work) and a
+# "fix:" line pointing to docs/setup.md. Exit code 0 if no FAIL.
+set -u
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/.." && pwd)
+IN_REPO=false
+[ -f "$ROOT/CMakeLists.txt" ] && [ -d "$ROOT/src" ] && IN_REPO=true
+
+N_OK=0 N_WARN=0 N_FAIL=0
+QUIET=${FWT_DOCTOR_QUIET:-}
+
+ok()   { N_OK=$((N_OK + 1)); [ -n "$QUIET" ] || printf 'OK    %s\n' "$1"; }
+warn() { N_WARN=$((N_WARN + 1)); printf 'WARN  %s\n' "$1"; [ -z "${2:-}" ] || printf '      fix: %s\n' "$2"; }
+fail() { N_FAIL=$((N_FAIL + 1)); printf 'FAIL  %s\n' "$1"; [ -z "${2:-}" ] || printf '      fix: %s\n' "$2"; }
+section() { [ -n "$QUIET" ] || printf '== %s\n' "$1"; }
+
+usage() {
+	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+	exit 2
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- tools: what deploying, recording and checking call ---------------------
+
+g_tools() {
+	section "tools (deploy, record, check)"
+	local t
+	for t in ssh scp; do
+		have $t && ok "$t" || fail "$t missing" "sudo apt install openssh-client"
+	done
+	have curl && ok "curl" || fail "curl missing (deploy.sh checks the node with it)" "sudo apt install curl"
+	for t in ffmpeg ffprobe; do
+		have $t && ok "$t ($($t -version 2>/dev/null | head -1 | cut -d' ' -f3))" ||
+			fail "$t missing (sei-dump decodes with it)" "sudo apt install ffmpeg   (docs/setup.md 2.3)"
+	done
+}
+
+# ---- bins: our laptop programs ----------------------------------------------
+
+find_bin() {  # find_bin name -> path or empty
+	local c
+	for c in "$HERE/$1" "$ROOT/build-host/src/tools/$1/$1"; do
+		[ -x "$c" ] && { echo "$c"; return; }
+	done
+}
+
+g_bins() {  # g_bins strict|lenient: missing = FAIL (operator) or WARN (developer)
+	section "programs (fwt-rec, sei-dump)"
+	local b p missing
+	for b in fwt-rec sei-dump; do
+		p=$(find_bin $b)
+		if [ -z "$p" ]; then
+			if [ "$1" = strict ]; then
+				fail "$b not found next to fwt-doctor" "use the complete host bundle (dist/fwtrial-host-*.tar.gz)"
+			else
+				warn "$b not built yet" "cmake -S . -B build-host && cmake --build build-host -j   (docs/setup.md 8.1)"
+			fi
+			continue
+		fi
+		missing=$(ldd "$p" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')
+		if [ -n "$missing" ]; then
+			case "$missing" in
+			*libcurl*) fail "$b: library missing: $missing" "sudo apt install libcurl4t64   (Ubuntu 24.04; docs/setup.md 2.3)" ;;
+			*) fail "$b: libraries missing: $missing" "install the packages providing them" ;;
+			esac
+		else
+			ok "$b (${p#$ROOT/})"
+		fi
+	done
+}
+
+# ---- build: laptop build and laptop tests -----------------------------------
+
+pkg_of() {  # apt package for a pkg-config module
+	case "$1" in
+	gstreamer-1.0 | gstreamer-app-1.0) echo libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev ;;
+	libmicrohttpd) echo libmicrohttpd-dev ;;
+	libcurl) echo libcurl4-openssl-dev ;;
+	esac
+}
+
+g_build() {
+	section "laptop build (compiler, libraries, GStreamer, venv)"
+	local t m v e
+	for t in gcc make pkg-config; do
+		have $t && ok "$t" || fail "$t missing" "sudo apt install build-essential pkg-config   (docs/setup.md 2.3)"
+	done
+	if have cmake; then
+		v=$(cmake --version | head -1 | awk '{print $3}')
+		if printf '3.20\n%s\n' "$v" | sort -V -C; then ok "cmake $v"; else
+			fail "cmake $v too old (need 3.20)" "sudo apt install cmake   (docs/setup.md 2.3)"; fi
+	else
+		fail "cmake missing" "sudo apt install cmake   (docs/setup.md 2.3)"
+	fi
+	if have pkg-config; then
+		for m in gstreamer-1.0 gstreamer-app-1.0 libmicrohttpd libcurl; do
+			v=$(pkg-config --modversion $m 2>/dev/null) && ok "$m $v (dev files)" ||
+				fail "$m dev files missing" "sudo apt install $(pkg_of $m)   (docs/setup.md 2.3)"
+		done
+	fi
+	if have gst-inspect-1.0; then
+		for e in appsrc appsink videoconvert x265enc h265parse; do
+			gst-inspect-1.0 --exists $e && ok "GStreamer element $e" ||
+				fail "GStreamer element $e missing (laptop encoder for the checks)" \
+					"sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good   (docs/setup.md 2.3)"
+		done
+	else
+		fail "gst-inspect-1.0 missing" "sudo apt install gstreamer1.0-tools   (docs/setup.md 2.3)"
+	fi
+	if ! $IN_REPO; then
+		warn "not in a repo checkout: venv not checked"
+		return
+	fi
+	local py="$ROOT/.venv/bin/python"
+	if [ ! -x "$py" ]; then
+		fail "repo venv missing (.venv)" "python3 -m venv .venv && .venv/bin/pip install -r tools-requirements.txt   (docs/setup.md 2.4)"
+		return
+	fi
+	v=$("$py" -I -c 'import cbor2, importlib.metadata as m; print(m.version("cbor2"))' 2>/dev/null)
+	case "$v" in
+	5.9.0) ok "venv: cbor2 $v" ;;
+	"") fail "venv: cbor2 missing" ".venv/bin/pip install -r tools-requirements.txt   (docs/setup.md 2.4)" ;;
+	*) warn "venv: cbor2 $v, pinned 5.9.0 (zcbor 0.9.1 breaks with 6.x, DL-03)" ".venv/bin/pip install -r tools-requirements.txt" ;;
+	esac
+	v=$("$py" -I -c 'import importlib.metadata as m; print(m.version("zcbor"))' 2>/dev/null)
+	[ "$v" = 0.9.1 ] && ok "venv: zcbor $v (regenerates the CBOR code)" ||
+		warn "venv: zcbor ${v:-missing}, pinned 0.9.1 (only needed after an ICD change)" ".venv/bin/pip install -r tools-requirements.txt   (docs/setup.md 2.4, 8.5)"
+}
+
+# ---- sdk: cross-build for the board -----------------------------------------
+
+g_sdk() {
+	section "TI SDK (cross-build for the board)"
+	local sdk=${FWT_SDK:-$HOME/ti/ti-processor-sdk-linux-adas-j722s-evm-11_02_02_05}
+	local hostr="$sdk/linux-devkit/sysroots/x86_64-arago-linux"
+	local tgt="$sdk/linux-devkit/sysroots/aarch64-oe-linux"
+	local cc="$hostr/usr/bin/aarch64-oe-linux/aarch64-oe-linux-gcc" pc
+	if [ ! -d "$tgt" ]; then
+		fail "TI SDK not found at $sdk" "install SDK 11.02.02.05 there, or export FWT_SDK=<path>   (docs/setup.md 2.2)"
+		return
+	fi
+	ok "TI SDK $sdk"
+	if [ -x "$cc" ] && "$cc" --version >/dev/null 2>&1; then
+		ok "cross compiler $("$cc" -dumpversion)"
+	else
+		fail "cross compiler missing or not runnable: $cc" "reinstall the SDK   (docs/setup.md 2.2)"
+	fi
+	for pc in gstreamer-1.0 gstreamer-app-1.0 libmicrohttpd libcurl; do
+		[ -f "$tgt/usr/lib/pkgconfig/$pc.pc" ] && ok "sysroot: $pc" ||
+			fail "sysroot: $pc missing" "use the ADAS SDK 11.02.02.05 (its sysroot has it)   (docs/setup.md 2.2)"
+	done
+}
+
+# ---- link: laptop <-> node ---------------------------------------------------
+
+NODE=""
+API_PORT=${FWT_PORT:-8080}
+
+g_link() {
+	section "link to $NODE"
+	local host=${NODE#*@} code
+	if ip route get "$host" >/dev/null 2>&1; then
+		ok "route to $host via $(ip route get "$host" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}' | head -1)"
+	else
+		fail "no route to $host" "set up the board link   (docs/setup.md 3)"
+		return
+	fi
+	if ping -c1 -W2 "$host" >/dev/null 2>&1; then ok "ping $host"; else
+		fail "$host does not answer ping" "board powered and cabled? nmcli con up board-link   (docs/setup.md 3)"; return; fi
+	if ssh -o BatchMode=yes -o ConnectTimeout=5 "$NODE" true 2>/dev/null; then
+		ok "ssh $NODE (key login)"
+	else
+		fail "ssh $NODE: no key login" "ssh-copy-id $NODE (or after reflashing: ssh-keygen -R $host)   (docs/setup.md 3)"
+	fi
+	if have curl; then
+		code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://$host:$API_PORT/v1/identity")
+		[ "$code" = 200 ] && ok "control interface http://$host:$API_PORT answers" ||
+			warn "control interface http://$host:$API_PORT not answering (HTTP ${code:-none})" \
+				"not installed or not running: deploy/deploy.sh $NODE; status: ssh $NODE sh /opt/fwtrial/current/install.sh --status   (docs/setup.md 8.6)"
+	fi
+}
+
+# ---- node: the board itself (one read-only ssh) -----------------------------
+
+# Runs on the board with plain sh; prints LEVEL|message|fix lines.
+NODE_SCRIPT='
+r() { printf "%s|%s|%s\n" "$1" "$2" "${3:-}"; }
+r OK "kernel $(uname -r), $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown image}")"
+if [ -c /dev/ptp0 ]; then
+	n=$(cat /sys/class/ptp/ptp0/n_periodic_outputs 2>/dev/null)
+	r OK "/dev/ptp0 ($(cat /sys/class/ptp/ptp0/clock_name 2>/dev/null), periodic outputs ${n:-?})"
+else
+	r FAIL "/dev/ptp0 missing (trigger needs the CPTS)" "check the image / device tree   (docs/setup.md 4)"
+fi
+enc=""
+for d in /sys/class/video4linux/video*; do
+	case "$(cat $d/name 2>/dev/null)" in *Wave5*encoder*) enc="/dev/${d##*/} ($(cat $d/name))" ;; esac
+done
+[ -n "$enc" ] && r OK "encoder $enc" || r FAIL "Wave5 encoder not found (no video device named *Wave5*encoder*)" "use the TI image as shipped   (docs/setup.md 4)"
+gst-inspect-1.0 --exists v4l2h265enc 2>/dev/null && r OK "GStreamer v4l2h265enc" || r FAIL "GStreamer v4l2h265enc missing" "use the TI image as shipped   (docs/setup.md 4)"
+for l in libmicrohttpd.so.12 libcurl.so.4; do
+	ls /usr/lib/$l* >/dev/null 2>&1 && r OK "library $l" || r FAIL "library $l missing" "use the TI image as shipped   (docs/setup.md 4)"
+done
+if src=$(findmnt -n -o SOURCE,FSTYPE /rec 2>/dev/null); then
+	free=$(df -Pm /rec | awk "NR==2 {print \$4}")
+	r OK "/rec mounted ($src), ${free} MB free"
+	grep -q "LABEL=rec" /etc/fstab || r WARN "/rec not in /etc/fstab by LABEL=rec: not mounted after a reboot" "docs/setup.md 6"
+else
+	r FAIL "/rec not mounted (recordings go there)" "docs/setup.md 6 (eMMC partition + fstab)"
+fi
+tfree=$(df -Pm /tmp | awk "NR==2 {print \$4}")
+[ "${tfree:-0}" -ge 200 ] && r OK "/tmp ${tfree} MB free (check scripts use it)" || r WARN "/tmp only ${tfree} MB free (check scripts copy binaries and streams there)" "clear /tmp on the board"
+if [ -L /opt/fwtrial/current ]; then
+	r INSTALLED "$(head -1 /opt/fwtrial/current/VERSION 2>/dev/null)"
+	for u in fwtrial-nodeagent fwtrial-ptp4l; do
+		en=$(systemctl is-enabled $u 2>/dev/null); ac=$(systemctl is-active $u 2>/dev/null)
+		if [ "$ac" = active ] && [ "$en" = enabled ]; then r OK "$u: enabled, active"
+		elif [ "$u" = fwtrial-nodeagent ]; then r WARN "$u: ${en:-?}, ${ac:-?} (no control interface)" "journalctl -u $u -b; systemctl start $u   (docs/setup.md 8.6)"
+		else r WARN "$u: ${en:-?}, ${ac:-?} (no PTP sync)" "journalctl -u $u -b   (docs/setup.md 8.6)"; fi
+	done
+	st=$(journalctl -u fwtrial-ptp4l -b --no-pager 2>/dev/null | grep -o "to [A-Z_]* on" | tail -1 | cut -d" " -f2)
+	case "$st" in
+	SLAVE) r OK "PTP: synced to a grandmaster" ;;
+	"") r WARN "PTP: state unknown (no ptp4l log this boot)" "docs/setup.md 5" ;;
+	*) r WARN "PTP: $st, no grandmaster: edges run on the free board clock (time not verified)" "start the laptop master   (docs/setup.md 5)" ;;
+	esac
+else
+	r WARN "fwtrial not installed (check scripts still work: they copy their own build)" "deploy/deploy.sh <user@node>   (docs/setup.md 8.6)"
+fi
+busy=""
+for f in /proc/[0-9]*/comm; do
+	c=$(cat $f 2>/dev/null) || continue
+	case "$c" in trigd|nodecap|cam-emu) p=${f#/proc/}; busy="$busy $c(${p%/comm})" ;; esac
+done
+[ -z "$busy" ] && r OK "no session running" || r WARN "running:$busy (a session is recording, or a check run left them)" "let it finish, or end it (disarm / kill)"
+if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; then r OK "system clock synchronized"
+else r WARN "system clock not synchronized (lock expiry uses the wall clock)" "laptop shares internet over the board link   (docs/setup.md 3)"; fi
+'
+
+g_node() {
+	section "board $NODE"
+	local out level msg fix head
+	if ! out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$NODE" sh -s <<<"$NODE_SCRIPT" 2>/dev/null); then
+		fail "cannot run checks on $NODE over ssh" "fix the link first: tools/fwt-doctor host-dev $NODE"
+		return
+	fi
+	while IFS='|' read -r level msg fix; do
+		case "$level" in
+		OK) ok "$msg" ;;
+		WARN) warn "$msg" "$fix" ;;
+		FAIL) fail "$msg" "$fix" ;;
+		INSTALLED)
+			# installed version vs this checkout
+			if ! $IN_REPO || ! head=$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null); then
+				ok "fwtrial $msg installed"
+			elif [ "${msg%-dirty}" != "$msg" ]; then
+				warn "fwtrial $msg installed: built from uncommitted changes" "commit, then deploy/deploy.sh $NODE   (docs/setup.md 8.6)"
+			elif [ "${msg##*-g}" != "$head" ]; then
+				warn "fwtrial $msg installed, this checkout is $head" "deploy/deploy.sh $NODE if the board should run it   (docs/setup.md 8.6)"
+			else
+				ok "fwtrial $msg installed (= this checkout)"
+			fi
+			;;
+		esac
+	done <<<"$out"
+}
+
+# ---- main --------------------------------------------------------------------
+
+SEL=""
+MODE=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--only) SEL=$(echo "${2:-}" | tr ',' ' '); shift 2 ;;
+	-h | --help) usage ;;
+	host | host-dev | dev) MODE=$1; shift ;;
+	-*) usage ;;
+	*) NODE=$1; shift ;;
+	esac
+done
+
+if [ -z "$SEL" ]; then
+	case "$MODE" in
+	host) SEL="tools bins:strict link" ;;
+	host-dev) SEL="tools build sdk bins:lenient link" ;;
+	dev) [ -n "$NODE" ] || usage; SEL="link node" ;;
+	*) usage ;;
+	esac
+fi
+
+for g in $SEL; do
+	case "$g" in
+	tools) g_tools ;;
+	bins | bins:strict) g_bins strict ;;
+	bins:lenient) g_bins lenient ;;
+	build) g_build ;;
+	sdk) g_sdk ;;
+	link) [ -n "$NODE" ] && g_link ;;
+	node) [ -n "$NODE" ] && g_node ;;
+	*) echo "fwt-doctor: unknown group $g" >&2; exit 2 ;;
+	esac
+done
+
+[ -n "$QUIET" ] && [ $N_FAIL -eq 0 ] && [ $N_WARN -eq 0 ] && exit 0
+echo
+echo "fwt-doctor: $N_OK OK, $N_WARN WARN, $N_FAIL FAIL"
+[ $N_FAIL -eq 0 ]
