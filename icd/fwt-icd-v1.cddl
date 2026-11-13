@@ -1,0 +1,140 @@
+; Node control interface, ICD version 1 (architecture §6, DL-03, DL-04, DL-22, DL-23).
+;
+; Transport: HTTP, paths /v1/..., Content-Type: application/cbor.
+; This file is the contract: C code is generated from it with zcbor
+; (src/nodeagent/gen, regenerate with src/nodeagent/gen.sh).
+;
+; Every response carries "icd": 1. Minor changes are additive only.
+; Map keys are encoded and expected in the order written here (zcbor decodes
+; maps in order): clients send request keys in this order.
+; Times are ns on the node's PTP clock unless named *_wall (CLOCK_REALTIME).
+; Indices are trigger indices within a session.
+;
+;   GET  /v1/identity                     -> identity
+;   GET  /v1/health                       -> health
+;   POST /v1/arm        arm-req           -> arm-rep
+;   POST /v1/disarm                       -> session-rep
+;   GET  /v1/sessions[?after=S]           -> sessions-rep    (page of <= 512)
+;   GET  /v1/segments?session=S[&from_idx=I] -> segments-rep (page of <= 512)
+;   POST /v1/lock       lock-req          -> lock-rep
+;   POST /v1/unlock     unlock-req        -> ok-rep
+;   GET  /v1/fetch?session=S&from_idx=I&to_idx=J | &last_s=N
+;                                         -> raw H.265 (not CBOR), see headers
+;   any error                             -> error (with HTTP status 4xx/5xx)
+
+icd-version = 1
+
+error = {
+  "icd" => icd-version,
+  "code" => tstr,          ; short machine-readable code, e.g. "busy", "bad-request"
+  "message" => tstr,
+}
+
+ok-rep = {
+  "icd" => icd-version,
+}
+
+identity = {
+  "icd" => icd-version,
+  "node" => tstr,          ; hostname
+  "version" => tstr,       ; software version
+  "fps_min" => uint,
+  "fps_max" => uint,
+  "width" => uint,
+  "height" => uint,
+}
+
+health = {
+  "icd" => icd-version,
+  "state" => tstr,         ; "idle" | "recording" | "failed"
+  "session" => uint,       ; current or last session, 0 = none
+  "ring_used" => uint,     ; bytes
+  "ring_locked" => uint,   ; bytes
+  "ring_free" => uint,     ; bytes available for recording
+  "depth_s" => uint,       ; recording time that fits in used + free at the last bitrate
+  "emmc_life_a" => uint,   ; EXT_CSD life time estimate A (1 = 0-10 % used), 0 = unknown
+  "emmc_life_b" => uint,
+  "emmc_pre_eol" => uint,  ; 1 normal, 2 warning, 3 urgent, 0 = unknown
+  "frames" => uint,        ; of the current/last session
+  "missing" => uint,
+  "temp_mc" => int,        ; SoC temperature, milli-degC
+  "phc_ns" => int,         ; PTP clock now
+  "time_verified" => bool, ; false until PTP lock is checked (DL-13)
+  "message" => tstr,       ; why "failed", else ""
+}
+
+arm-req = {
+  "session" => uint,       ; from the plan maker (DL-20), > 0
+  "fps" => uint,
+  ? "t0" => int,           ; PTP time of edge 0; default (single node only): next whole second + 1 s
+}
+
+arm-rep = {
+  "icd" => icd-version,
+  "session" => uint,
+  "t0" => int,             ; the T0 used (send the same explicit t0 to every node of a pack)
+  "period" => uint,        ; ns
+}
+
+session-rep = {
+  "icd" => icd-version,
+  "session" => uint,
+}
+
+session-info = {
+  "session" => uint,
+  "status" => tstr,        ; "recording" | "complete" | "interrupted"
+  "start_wall" => int,
+  "t0" => int,
+  "period" => uint,
+  "first_idx" => int,      ; available range (-1 if nothing left)
+  "last_idx" => int,
+  "frames" => uint,        ; recorded in total
+  "missing" => uint,
+  "segments" => uint,      ; available
+  "bytes" => uint,         ; available
+  "truncated" => bool,     ; segments reclaimed by the ring
+}
+
+sessions-rep = {
+  "icd" => icd-version,
+  "sessions" => [* session-info],
+  "more" => bool,          ; another page: ?after=<last session>
+}
+
+segment-info = {
+  "first_idx" => int,
+  "last_idx" => int,
+  "t_first" => int,
+  "t_last" => int,
+  "bytes" => uint,
+  "frames" => uint,
+  "missing" => uint,
+  "keys" => uint,
+  "locked" => bool,
+  "recovered" => bool,
+}
+
+segments-rep = {
+  "icd" => icd-version,
+  "session" => uint,
+  "segments" => [* segment-info],
+  "more" => bool,          ; another page: &from_idx=<last first_idx + 1>
+}
+
+lock-req = {
+  "session" => uint,
+  "from_idx" => int,
+  "to_idx" => int,         ; may be in the future (post-event window)
+  "ttl_s" => uint,
+  ? "reason" => tstr,
+}
+
+lock-rep = {
+  "icd" => icd-version,
+  "lock_id" => uint,
+}
+
+unlock-req = {
+  "lock_id" => uint,
+}

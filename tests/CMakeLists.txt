@@ -21,3 +21,7 @@ add_test(NAME nodecap COMMAND test_nodecap)
 add_executable(test_recorder test_recorder.c)
 target_link_libraries(test_recorder PRIVATE recorder fwt_common)
 add_test(NAME recorder COMMAND test_recorder)
+
+add_executable(test_nodeagent test_nodeagent.c)
+target_link_libraries(test_nodeagent PRIVATE na_fetch recorder fwt_common)
+add_test(NAME nodeagent COMMAND test_nodeagent)
