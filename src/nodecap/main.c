@@ -1,7 +1,10 @@
 /*
  * nodecap v1: one encoded frame per trigger edge, each carrying its index.
  *
- *   trigd edge -> test frame (index drawn in, DL-17) -> appsrc
+ *   frame source (DL-26):
+ *     test: one frame per trigd edge, index drawn in (DL-17)
+ *     emu:  cam-emu frames, bound to trigd edges by time (DL-27, nc_match.h)
+ *   -> appsrc
  *     -> H.265 encoder -> h265parse -> appsink
  *     -> index from PTS (DL-15) -> per-frame SEI (DL-16)
  *     -> recorder: segments, manifest, ring, locks in --rec DIR (DL-18..21)
@@ -36,10 +39,13 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 
+#include "fwt_cam_proto.h"
+#include "fwt_clock.h"
 #include "fwt_sei.h"
 #include "fwt_seqcheck.h"
 #include "fwt_stamp.h"
 #include "fwt_trig_msg.h"
+#include "nc_match.h"
 #include "nc_source.h"
 #include "nodecap_core.h"
 #include "rec_ctl.h"
@@ -50,6 +56,9 @@
 struct opts {
 	const char *sock_path, *enc, *out_path, *log_path, *enc_extra, *level;
 	const char *rec_dir, *ctl_path, *src_name;
+	const char *cam_sock, *clock_dev;  /* emu source; clock_dev NULL = system clock */
+	int cam_bufs;
+	int64_t cam_latency_ns, cam_window_ns;
 	uint64_t ring_max_mb;
 	int seg_seconds, lock_cap_pct;
 	int w, h;
@@ -62,12 +71,20 @@ struct stats {
 	uint64_t edges, pushed, dropped_in, frames_out, unmatched, keyframes, no_vcl;
 	uint64_t bytes;
 	uint64_t rec_frames, rec_skipped, rec_errors, locks_ok, locks_refused;
+	/* camera sources (emu) */
+	uint64_t cam_frames, cam_before_start, seq_jumps, seq_skipped;
 };
 
 struct nodecap {
 	struct opts o;
 	GstElement *pipe, *src, *sink;
 	struct nc_source *cam;  /* frame source (DL-26) */
+	bool by_time;           /* frames bound to edges by time (DL-27) */
+	struct nc_match match;
+	struct fwt_clock clk;
+	bool have_seq, lat_warned;
+	bool cam_gone;          /* source closed: its edges left become gaps */
+	uint32_t last_seq;
 	size_t frame_size;
 	struct fwt_stamp_geom geom;
 
@@ -100,7 +117,14 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"usage: %s [options]\n"
 		"  --sock PATH        trigd socket (default %s)\n"
-		"  --src test         frame source: test = built-in, one frame per edge (default)\n"
+		"  --src test|emu     frame source: test = built-in, one frame per edge (default);\n"
+		"                     emu = cam-emu process, frames bound to edges by time\n"
+		"  --cam-sock PATH    cam-emu socket (default %s)\n"
+		"  --cam-bufs N       camera buffers (default 4)\n"
+		"  --cam-latency-ms X expected edge -> frame timestamp (default 25)\n"
+		"  --cam-window-ms X  accept frames +- X around edge + latency (default: half period)\n"
+		"  --clock phc|sys    trigd's clock, for edge -> monotonic time (default phc)\n"
+		"  --dev PATH         PTP device (default /dev/ptp0)\n"
 		"  --enc v4l2|x265    encoder: Wave5 (board) or software (laptop) (default v4l2)\n"
 		"  --width W --height H   frame size (default 1920x1200)\n"
 		"  --bitrate BPS      target bitrate, bit/s (default 5000000)\n"
@@ -116,7 +140,7 @@ static void usage(const char *prog)
 		"  --count N          stop after N edges\n"
 		"  --no-sei           don't insert the SEI (debug)\n"
 		"  -q                 quiet: summary only\n",
-		prog, FWT_TRIGD_SOCK_DEFAULT, REC_CTL_SOCK_DEFAULT);
+		prog, FWT_TRIGD_SOCK_DEFAULT, FWT_CAMEMU_SOCK_DEFAULT, REC_CTL_SOCK_DEFAULT);
 }
 
 static int parse_opts(int argc, char **argv, struct opts *o)
@@ -124,6 +148,12 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	static const struct option lo[] = {
 		{ "sock", required_argument, NULL, 'S' },
 		{ "src", required_argument, NULL, 'X' },
+		{ "cam-sock", required_argument, NULL, 'c' },
+		{ "cam-bufs", required_argument, NULL, 'B' },
+		{ "cam-latency-ms", required_argument, NULL, 'a' },
+		{ "cam-window-ms", required_argument, NULL, 'w' },
+		{ "clock", required_argument, NULL, 'k' },
+		{ "dev", required_argument, NULL, 'd' },
 		{ "enc", required_argument, NULL, 'e' },
 		{ "width", required_argument, NULL, 'W' },
 		{ "height", required_argument, NULL, 'H' },
@@ -143,9 +173,13 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
+	const char *dev = "/dev/ptp0";
+	bool sys_clock = false;
 	int c;
 
 	*o = (struct opts){ .sock_path = FWT_TRIGD_SOCK_DEFAULT, .enc = "v4l2",
+			    .cam_sock = FWT_CAMEMU_SOCK_DEFAULT, .cam_bufs = 4,
+			    .cam_latency_ns = 25000000,
 			    .enc_extra = "", .level = "5", .ctl_path = REC_CTL_SOCK_DEFAULT,
 			    .src_name = "test",
 			    .seg_seconds = 4, .lock_cap_pct = 20,
@@ -154,6 +188,19 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		switch (c) {
 		case 'S': o->sock_path = optarg; break;
 		case 'X': o->src_name = optarg; break;
+		case 'c': o->cam_sock = optarg; break;
+		case 'B': o->cam_bufs = atoi(optarg); break;
+		case 'a': o->cam_latency_ns = (int64_t)(atof(optarg) * 1e6); break;
+		case 'w': o->cam_window_ns = (int64_t)(atof(optarg) * 1e6); break;
+		case 'k':
+			if (!strcmp(optarg, "sys"))
+				sys_clock = true;
+			else if (strcmp(optarg, "phc")) {
+				fprintf(stderr, "nodecap: --clock must be phc or sys\n");
+				return -1;
+			}
+			break;
+		case 'd': dev = optarg; break;
 		case 'e': o->enc = optarg; break;
 		case 'W': o->w = atoi(optarg); break;
 		case 'H': o->h = atoi(optarg); break;
@@ -173,8 +220,14 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		default: usage(argv[0]); return -1;
 		}
 	}
-	if (strcmp(o->src_name, "test")) {
-		fprintf(stderr, "nodecap: --src must be test\n");
+	o->clock_dev = sys_clock ? NULL : dev;
+	if (strcmp(o->src_name, "test") && strcmp(o->src_name, "emu")) {
+		fprintf(stderr, "nodecap: --src must be test or emu\n");
+		return -1;
+	}
+	if (o->cam_bufs < 2 || o->cam_bufs > FWT_CAM_MAX_BUFS || o->cam_latency_ns < 0) {
+		fprintf(stderr, "nodecap: --cam-bufs 2..%d, --cam-latency-ms >= 0\n",
+			FWT_CAM_MAX_BUFS);
 		return -1;
 	}
 	if (strcmp(o->enc, "v4l2") && strcmp(o->enc, "x265")) {
@@ -429,6 +482,15 @@ static int start_session(struct nodecap *nc, const struct fwt_trig_msg *m)
 		"T0 %" PRId64 ", first index %" PRId64 "\n", nc->session, nc->period_ns,
 		nc_fps_of(nc->period_ns), nc->t0_ns, m->index);
 	nc->started = true;
+	if (nc->by_time) {
+		struct nc_match_cfg mc = { .period_ns = nc->period_ns,
+					   .latency_ns = nc->o.cam_latency_ns,
+					   .window_ns = nc->o.cam_window_ns };
+
+		nc_match_init(&nc->match, &mc);
+		fprintf(stderr, "nodecap: binding frames by time: latency %.2f ms, window +- %.2f ms\n",
+			nc->o.cam_latency_ns / 1e6, nc_match_window(&nc->match) / 1e6);
+	}
 	if (nc->rec_on) {
 		g_mutex_lock(&nc->lock);
 		int r = rec_session_start(&nc->rec, nc->session, nc->t0_ns, nc->period_ns);
@@ -443,23 +505,15 @@ static int start_session(struct nodecap *nc, const struct fwt_trig_msg *m)
 	return build_pipeline(nc);
 }
 
-/* Push one frame of the source to the encoder, bound to its edge. */
-static void push_frame(struct nodecap *nc, const struct nc_frame *f, const struct fwt_trig_msg *m)
+/* Copy a source frame into an encoder buffer (drawing the index for the test
+ * source). NULL if the frame has the wrong size. */
+static GstBuffer *make_buffer(struct nodecap *nc, const struct nc_frame *f)
 {
-	struct nc_edge e = { .index = m->index, .t_ns = m->t_ns, .session = m->session,
-			     .flags = m->flags };
-
-	if (gst_app_src_get_current_level_buffers(GST_APP_SRC(nc->src)) >= SRC_MAX_QUEUED) {
-		nc->st.dropped_in++;
-		fprintf(stderr, "nodecap: encoder behind, frame for index %" PRId64
-			" dropped\n", m->index);
-		return;
-	}
 	if (f->len != nc->frame_size) {
 		fprintf(stderr, "nodecap: frame of %zu bytes, want %zu: dropped\n", f->len,
 			nc->frame_size);
 		nc->st.dropped_in++;
-		return;
+		return NULL;
 	}
 
 	GstBuffer *buf = gst_buffer_new_allocate(NULL, nc->frame_size, NULL);
@@ -471,33 +525,142 @@ static void push_frame(struct nodecap *nc, const struct nc_frame *f, const struc
 		fwt_stamp_draw(map.data, nc->o.w, map.data + (size_t)nc->o.w * nc->o.h, nc->o.w,
 			       nc->o.w, nc->o.h, &nc->geom, f->stamp);
 	gst_buffer_unmap(buf, &map);
+	return buf;
+}
 
-	GST_BUFFER_PTS(buf) = (GstClockTime)nc_pts_of(m->t_ns, nc->t0_ns);
+/* Push a frame to the encoder, bound to its edge (takes the buffer). */
+static void push_buffer(struct nodecap *nc, GstBuffer *buf, const struct nc_edge *e)
+{
+	if (gst_app_src_get_current_level_buffers(GST_APP_SRC(nc->src)) >= SRC_MAX_QUEUED) {
+		nc->st.dropped_in++;
+		fprintf(stderr, "nodecap: encoder behind, frame for index %" PRId64
+			" dropped\n", e->index);
+		gst_buffer_unref(buf);
+		return;
+	}
+	GST_BUFFER_PTS(buf) = (GstClockTime)nc_pts_of(e->t_ns, nc->t0_ns);
 	GST_BUFFER_DURATION(buf) = (GstClockTime)nc->period_ns;
 
 	g_mutex_lock(&nc->lock);
-	nc_table_put(&nc->table, &e);
+	nc_table_put(&nc->table, e);
 	g_mutex_unlock(&nc->lock);
 
 	if (gst_app_src_push_buffer(GST_APP_SRC(nc->src), buf) != GST_FLOW_OK)
-		fprintf(stderr, "nodecap: push for index %" PRId64 " refused\n", m->index);
+		fprintf(stderr, "nodecap: push for index %" PRId64 " refused\n", e->index);
 	else
 		nc->st.pushed++;
 }
 
+/* Edges whose window has passed: push their frame (a gap if none). */
+static void push_decided(struct nodecap *nc, int64_t now_mono)
+{
+	struct nc_medge d;
+
+	if (!nc->by_time || !nc->started)
+		return;
+	while (nc_match_take_decided(&nc->match, now_mono, &d)) {
+		if (!d.has_frame) {
+			if (nc->match.st.no_frame <= 5)
+				fprintf(stderr, "nodecap: edge %" PRId64 " got no frame\n", d.index);
+			continue;
+		}
+		struct nc_edge e = { .index = d.index, .t_ns = d.t_ns, .session = d.session,
+				     .flags = d.flags };
+
+		push_buffer(nc, (GstBuffer *)(uintptr_t)d.tag, &e);
+	}
+
+	int64_t mean;
+
+	/* expected latency far off: frames sit near the window edge (DL-27) */
+	if (!nc->lat_warned && nc->match.st.bound >= 30 &&
+	    nc_match_latency_mean(&nc->match, &mean) &&
+	    llabs(mean - nc->o.cam_latency_ns) > nc->period_ns / 8) {
+		nc->lat_warned = true;
+		fprintf(stderr, "nodecap: WARNING: measured camera latency %.2f ms, expected "
+			"%.2f ms (--cam-latency-ms)\n", mean / 1e6, nc->o.cam_latency_ns / 1e6);
+	}
+}
+
+/* A camera frame (emu): copy it, give the buffer back, offer it to the matcher. */
+static void take_camera_frame(struct nodecap *nc, const struct nc_frame *f)
+{
+	nc->st.cam_frames++;
+	if (nc->have_seq && f->sequence != nc->last_seq + 1) {
+		nc->st.seq_jumps++;
+		nc->st.seq_skipped += f->sequence - nc->last_seq - 1;
+		if (nc->st.seq_jumps <= 5)
+			fprintf(stderr, "nodecap: camera sequence %u -> %u\n", nc->last_seq,
+				f->sequence);
+	}
+	nc->have_seq = true;
+	nc->last_seq = f->sequence;
+
+	if (!nc->started) {
+		nc->st.cam_before_start++;  /* no edge yet: nothing to bind to */
+		return;
+	}
+	GstBuffer *buf = make_buffer(nc, f);
+
+	if (!buf)
+		return;
+
+	int64_t index = -1;
+	uint64_t displaced = 0;
+	enum nc_match_result r = nc_match_frame(&nc->match, f->t_mono_ns,
+						(uint64_t)(uintptr_t)buf, &index, &displaced);
+
+	switch (r) {
+	case NC_M_HELD:
+		break;
+	case NC_M_HELD_DISPLACED:
+		gst_buffer_unref((GstBuffer *)(uintptr_t)displaced);
+		if (nc->match.st.lost <= 5)
+			fprintf(stderr, "nodecap: two frames for edge %" PRId64
+				": the nearer one kept\n", index);
+		break;
+	case NC_M_LOST:
+		gst_buffer_unref(buf);
+		if (nc->match.st.lost <= 5)
+			fprintf(stderr, "nodecap: two frames for edge %" PRId64
+				": the nearer one kept\n", index);
+		break;
+	case NC_M_NO_EDGE:
+		gst_buffer_unref(buf);
+		if (nc->match.st.no_edge <= 5)
+			fprintf(stderr, "nodecap: frame sequence %u (t %" PRId64
+				") has no edge in its window: spurious\n", f->sequence, f->t_mono_ns);
+		break;
+	}
+}
+
 /* Take every ready frame from the source. */
-static void drain_source(struct nodecap *nc)
+static int drain_source(struct nodecap *nc)
 {
 	struct nc_frame f;
 	int r;
 
 	while ((r = nc->cam->ops->dequeue(nc->cam, &f)) == 1) {
-		if (f.has_edge)  /* bound by construction (test source) */
-			push_frame(nc, &f, &f.edge);
+		if (f.has_edge) {  /* bound by construction (test source) */
+			GstBuffer *buf = make_buffer(nc, &f);
+			struct nc_edge e = { .index = f.edge.index, .t_ns = f.edge.t_ns,
+					     .session = f.edge.session, .flags = f.edge.flags };
+
+			if (buf)
+				push_buffer(nc, buf, &e);
+		} else {
+			take_camera_frame(nc, &f);
+		}
 		nc->cam->ops->release(nc->cam, &f);
 	}
-	if (r < 0)
-		fprintf(stderr, "nodecap: frame source %s: %s\n", nc->cam->name, strerror(-r));
+	if (r < 0) {
+		/* Not a failure by itself: edges still waiting for frames end up
+		 * without one (gaps), which fails the run if frames were missing. */
+		fprintf(stderr, "nodecap: frame source %s stopped: %s\n", nc->cam->name,
+			strerror(-r));
+		nc->cam_gone = true;
+	}
+	return r < 0 ? r : 0;
 }
 
 static void on_edge(struct nodecap *nc, const struct fwt_trig_msg *m)
@@ -507,6 +670,21 @@ static void on_edge(struct nodecap *nc, const struct fwt_trig_msg *m)
 		return;
 	}
 	nc->st.edges++;
+	if (nc->by_time) {
+		int64_t off = 0;
+		int r = fwt_clock_mono_offset(&nc->clk, &off);
+
+		if (r)
+			fprintf(stderr, "nodecap: clock: %s\n", strerror(-r));
+		struct nc_medge e = { .index = m->index, .t_ns = m->t_ns, .t_mono_ns = m->t_ns - off,
+				      .session = m->session, .flags = m->flags };
+
+		push_decided(nc, fwt_mono_now_ns());
+		if (!nc_match_edge(&nc->match, &e))
+			fprintf(stderr, "nodecap: too many undecided edges, edge %" PRId64
+				" not bound\n", m->index);
+		return;
+	}
 	nc->cam->ops->on_edge(nc->cam, m);
 	drain_source(nc);
 }
@@ -554,9 +732,20 @@ static int init_frames(struct nodecap *nc)
 		fprintf(stderr, "nodecap: frame too small for the index stamp\n");
 		return -1;
 	}
-	nc->cam = nc_source_test_new(nc->o.w, nc->o.h);
+	if (!strcmp(nc->o.src_name, "emu")) {
+		int r = fwt_clock_open(&nc->clk, nc->o.clock_dev);
+
+		if (r) {
+			fprintf(stderr, "nodecap: clock %s: %s\n", nc->o.clock_dev, strerror(-r));
+			return -1;
+		}
+		nc->by_time = true;
+		nc->cam = nc_source_emu_new(nc->o.cam_sock, nc->o.w, nc->o.h, nc->o.cam_bufs);
+	} else {
+		nc->cam = nc_source_test_new(nc->o.w, nc->o.h);
+	}
 	if (!nc->cam) {
-		fprintf(stderr, "nodecap: frame source %s: out of memory\n", nc->o.src_name);
+		fprintf(stderr, "nodecap: frame source %s failed\n", nc->o.src_name);
 		return -1;
 	}
 	return 0;
@@ -719,17 +908,24 @@ int main(int argc, char **argv)
 	int64_t last_index = -1;
 
 	while (!g_stop && !ended && !failed && (!nc.o.count || (int64_t)nc.st.edges < nc.o.count)) {
-		struct pollfd p[2] = { { .fd = fd, .events = POLLIN },
-				       { .fd = nc.ctl_fd, .events = POLLIN } };
+		struct pollfd p[3] = { { .fd = fd, .events = POLLIN },
+				       { .fd = nc.ctl_fd, .events = POLLIN },
+				       { .fd = nc.cam_gone ? -1 : nc.cam->ops->fd(nc.cam),
+					 .events = POLLIN } };
 
 		if (nc.pipe && poll_bus(&nc, 0) != 0) {
 			failed = true;
 			break;
 		}
-		if (poll(p, 2, 100) <= 0)
+		int np = poll(p, 3, nc.by_time ? 10 : 100);
+
+		push_decided(&nc, fwt_mono_now_ns());
+		if (np <= 0)
 			continue;
 		if (p[1].revents & POLLIN)
 			handle_ctl(&nc);
+		if (p[2].revents & (POLLIN | POLLHUP | POLLERR))
+			drain_source(&nc);
 		if (!(p[0].revents & POLLIN))
 			continue;
 
@@ -753,6 +949,22 @@ int main(int argc, char **argv)
 	if (!ended)
 		send_type(fd, &trigd, FWT_TRIG_UNSUBSCRIBE);
 	close(fd);
+
+	/* Camera frames of the last edges are still on their way: wait for their
+	 * windows to pass (bounded), then decide whatever is left. */
+	if (nc.by_time && nc.started && !failed) {
+		int64_t until = fwt_mono_now_ns() + nc.o.cam_latency_ns +
+				nc_match_window(&nc.match) + 2 * nc.period_ns + 100000000LL;
+
+		while (nc.match.n && !nc.cam_gone && fwt_mono_now_ns() < until) {
+			struct pollfd p = { .fd = nc.cam->ops->fd(nc.cam), .events = POLLIN };
+
+			if (poll(&p, 1, 5) > 0)
+				drain_source(&nc);
+			push_decided(&nc, fwt_mono_now_ns());
+		}
+		push_decided(&nc, INT64_MAX);
+	}
 
 	if (nc.pipe) {
 		if (!failed && drain(&nc) != 0)
@@ -794,12 +1006,30 @@ int main(int argc, char **argv)
 	       nc.chk.gaps, nc.chk.missing, nc.chk.dups, nc.chk.backward, s->unmatched,
 	       s->no_vcl, s->bytes, nc.o.no_sei ? "off" : "on", failed ? " [failed]" : "");
 
+	if (nc.by_time) {
+		const struct nc_match_stats *ms = &nc.match.st;
+		int64_t mean = 0;
+		bool have_lat = nc_match_latency_mean(&nc.match, &mean);
+
+		printf("camera: frames %" PRIu64 ", bound %" PRIu64 ", spurious %" PRIu64
+		       " (no edge %" PRIu64 ", nearer frame won %" PRIu64 "), edges without frame %"
+		       PRIu64 ", sequence jumps %" PRIu64 " (skipped %" PRIu64 "), before session %"
+		       PRIu64 ", latency ms min/mean/max %.3f/%.3f/%.3f (expected %.3f, window +-%.3f)\n",
+		       s->cam_frames, ms->bound, ms->no_edge + ms->lost, ms->no_edge, ms->lost,
+		       ms->no_frame, s->seq_jumps, s->seq_skipped, s->cam_before_start,
+		       have_lat ? ms->lat_min / 1e6 : 0, have_lat ? mean / 1e6 : 0,
+		       have_lat ? ms->lat_max / 1e6 : 0, nc.o.cam_latency_ns / 1e6,
+		       nc.started ? nc_match_window(&nc.match) / 1e6 : 0);
+	}
+
 	bool ok = !failed && s->frames_out == s->edges && !s->dropped_in && !nc.chk.gaps &&
 		  !nc.chk.dups && !nc.chk.backward && !s->unmatched && !s->no_vcl &&
 		  (!nc.rec_on || (s->rec_frames == s->frames_out && !s->rec_errors));
 	g_mutex_unlock(&nc.lock);
 
 	nc.cam->ops->destroy(nc.cam);
+	if (nc.by_time)
+		fwt_clock_close(&nc.clk);
 	if (nc.out)
 		fclose(nc.out);
 	if (nc.log)
