@@ -120,7 +120,8 @@ All dates 2026-11-12.
 - **Measured (board):** 600 edges at 60 fps all captured, a constant +14 ns from T0 + k·P (routing); every interval = the period (0 ns at the 2 ns resolution); fallback and forced modes as designed (`trigd-check dev`).
 - **Seen:** the CPTS makes periods in whole 2 ns ticks; at 30 fps the period 33,333,333 ns ran 1 ns short per edge (30 ppb drift off the plan: 54 µs per 30 min; the index would slip after ~6 days). Periods are now whole ticks (30 fps = 33,333,334 ns, computed the same on every node); an odd `--period-ns` is rounded with a warning.
 - **Limits:** proves the edge fired inside the SoC, not at the pin (needs the pin mux to J1 pin 18 + logic analyzer).
-- **Later:** M4 over 30 min with PTP locked (edges must follow `ptp4l`'s corrections); edge to the connector pin.
+- **Found with PTP locked (soak 2, gap G4):** the edges do not follow PTP's frequency correction. The CPTS driver corrects the time counter and only the periodic output the kernel uses as PPS (`ti,pps`); our output (no `ti,pps`, so `trigd` owns it) runs at the crystal rate: 57 ppm off PTP time. The side effect of leaving out `ti,pps` was not visible until edges were measured with PTP locked.
+- **Later:** CPTS driver patch: apply the correction to every enabled periodic output (camera bring-up, architecture §11.2 step 1), then M4 again over 30 min with PTP locked; edge to the connector pin.
 
 ## DL-10 Trial camera
 
