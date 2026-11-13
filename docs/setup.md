@@ -70,11 +70,12 @@ sudo apt install -y \
   linuxptp python3-venv cmake pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libgstreamer-plugins-bad1.0-dev libmicrohttpd-dev \
+  gstreamer1.0-plugins-bad \
   ffmpeg gdb-multiarch valgrind cppcheck clang-format
 ```
 The dev packages are only for building and testing on the laptop; board binaries are always built against the SDK sysroot. The laptop has GStreamer 1.24, the board 1.22: avoid APIs newer than 1.22.
 
-**Verify:** `command -v ptp4l phc2sys cmake ffprobe`
+**Verify:** `command -v ptp4l phc2sys cmake ffprobe` and `gst-inspect-1.0 x265enc`, `gst-inspect-1.0 h265parse` (laptop encoder for `nodecap-check.sh host`).
 
 ### 2.4 Python tools (venv)
 
@@ -193,9 +194,50 @@ Source: `dts/k3-j722s-evm-fwtrial-cpts-loop.dtso` (gap G1, decision log DL-09). 
 
 ---
 
-## 8. Build and deploy our code (NOT YET)
+## 8. Build, test and run our code
 
-Planned: CMake with `cmake/j722s-sdk.cmake` (SDK compiler + sysroot), cross-build, copy to the board, systemd units. To be written with the code.
+Run from the repo root. Two builds of the same code (DL-05): laptop (unit tests, laptop runs) and board (cross-compiled against the SDK sysroot via `cmake/j722s-sdk.cmake`; set `FWT_SDK` if the SDK is not at the default path).
+
+### 8.1 Build and unit tests
+```sh
+cmake -S . -B build-host && \
+cmake --build build-host -j && \
+ctest --test-dir build-host --output-on-failure
+```
+```sh
+cmake -S . -B build-board -DCMAKE_TOOLCHAIN_FILE=cmake/j722s-sdk.cmake && \
+cmake --build build-board -j
+```
+**Verify:** `100% tests passed`; no `warning:` in either build.
+
+### 8.2 End-to-end checks
+| Script | Mode | What it runs |
+|---|---|---|
+| `tests/trigd-check.sh` | `host` | build, unit tests; `trigd` on the system clock + `trig-listen`: 90 edges, gap detection, two subscribers |
+| | `dev <user@node>` | cross-build, copy to `/tmp`; 300 edges on `/dev/ptp0`, stop with SIGINT, output disarmed |
+| `tests/nodecap-check.sh` | `host` | build, unit tests; `trigd` + `nodecap` (x265): 90 frames, gap detection; `sei-dump` on each stream |
+| | `dev <user@node>` | laptop + board builds; 300 edges on `/dev/ptp0` with Wave5 on the board; stream copied back, `sei-dump` here |
+
+```sh
+tests/trigd-check.sh host
+tests/nodecap-check.sh dev root@10.42.0.132
+```
+**Verify:** each ends with `ALL PASSED (<mode>)`. Every step prints PASS/FAIL with the compared values; full logs in the `/tmp/<name>-check.XXXXXX` directory named at the end. Nothing is installed on the board (binaries and output in `/tmp`, a RAM disk).
+
+### 8.3 Run by hand
+```sh
+# board: 300 edges @30 fps on the PTP clock, Wave5, stream + per-frame CSV in /tmp
+/tmp/trigd --count 300 2>/tmp/trigd.log & sleep 0.5; \
+/tmp/nodecap --enc v4l2 --out /tmp/nc.h265 --log /tmp/nc.csv -q
+```
+```sh
+# laptop: check a stream (exit code 0 = pass)
+build-host/src/tools/sei-dump/sei-dump -q --frames 300 nc.h265
+```
+- `trigd --help`, `nodecap --help`: options (clock, fps, T0 offset, count, encoder, bitrate, `--enc-extra` for extra Wave5 controls).
+- `nodecap` needs `trigd` running first; both stop at `trigd`'s END (`--count`) or Ctrl-C.
+
+Not yet: install paths, systemd units (DL-14), Yocto layer.
 
 ---
 

@@ -85,7 +85,7 @@ From TI SPRUJB5 (Fig. 2-1/2-2, Tables 2-6, 2-19):
 
 ### 2.3 Sensor
 
-- Product sensor: onsemi AR0235. Bench module believed AR0234 (same family) *(verify)*.
+- Product sensor: onsemi AR0235. Bench module: AR0234 (same family), **not detected on any EVM connector** and no driver in the image: gap G3 (§11.6).
 - **Camera choice rule for the trial:** a camera with an existing driver in the TI SDK, preferably one whose sensor and driver support an external trigger. Without trigger support, the trigger chain is proven to the connector pin with the test source, and the gap is stated.
 - **The AR0235 driver and ISP tuning are ours** (AC §7, §9) and a later milestone: V4L2 subdev with trigger (slave) mode, manual exposure/gain/white balance, frame counter. The overlay is based on `k3-j722s-evm-csi2-quad-rpi-cam-imx219.dtso`.
 
@@ -103,7 +103,7 @@ trigger-driven test source (now) │ AR023x -> CSI2RX3 -> v4l2src -> tiovxisp (c
 - **Now:** a thin pipeline; our code sits at `appsrc` (one frame per trigger edge) and `appsink`.
 - **Later:** the same logic wrapped as our own elements (`trigsrc`, `trigsei`, `segmentsink`), so the whole node is one portable pipeline. On Rockchip only the middle changes (`mpph265enc`).
 - Logic is written as plain functions (SEI building, drop check, segment/manifest writing) so it can be wrapped without rewriting.
-- The trigger PHC time is carried as the buffer timestamp through the encoder. Measured (P-1): Wave5 passes timestamps through for almost all frames, but lost one and repeated one at stream start, so it is **checked at the encoder output** (§4.4), never trusted blindly.
+- Each frame's buffer timestamp is **PTS = edge time − T0** (DL-15), carried through the encoder. Measured: P-1 saw Wave5 lose one and repeat one timestamp at stream start; `nodecap` (300 edges) saw none. Either way it is **checked at the encoder output** (§4.4), never trusted blindly.
 
 **Mandatory encoder settings** (measured in P-1, `v4l2h265enc extra-controls`):
 
@@ -113,8 +113,11 @@ trigger-driven test source (now) │ AR023x -> CSI2RX3 -> v4l2src -> tiovxisp (c
 | `video_bitrate`, `video_bitrate_mode` | per AC §2, CBR | bitrate target |
 | `video_gop_size` | = fps | keyframe every 1 s |
 | `prepend_sps_and_pps_to_idr` | 1 | default 0; headers before every keyframe, so every 4 s segment decodes on its own (verified) |
-| `hevc_level` | 5 | 1920x1200 exceeds level 4.1; the default signals a wrong level *(verify)* |
-| input caps | `colorimetry=bt709` | the encoder rejects buffer sources without explicit colorimetry |
+| `hevc_level` | 5 | 1920x1200 exceeds level 4.1; the default signals a wrong level (still "10" in `nodecap` output) *(verify)* |
+| input caps | `colorimetry=bt709`, `interlace-mode=progressive`, width/height multiples of 8 | the encoder only accepts caps with these fields set explicitly (a missing field = not-negotiated) |
+
+- **End of stream:** Wave5 does not forward EOS; `nodecap` treats "every pushed frame came out" as drained.
+- **Laptop encoder** (`x265enc`, tests only): needs I420 (`videoconvert`) and shifts output PTS by 1000 h, recorded in the segment, so `nodecap` reads PTS as stream time, never raw.
 
 Measured capacity: **~100 fps at 1920x1200** (need 60). Bitrate on noise (worst case) ~2x the target; real content to be measured with a camera. The test source pushes pre-made buffers: rendering per frame (`videotestsrc`) costs a full core at 10-40 fps.
 
@@ -162,10 +165,10 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 - **Match by time, not by queue position:** frame ↔ edge k if `t_frame − t_edge(k) ≈ expected latency (± tolerance)`. The latency (exposure + readout + capture, tens of ms) is measured at start; edges are 16.7-33.3 ms apart, so the match is unambiguous.
 - Clocks: edges are in PHC time, V4L2 frames in CLOCK_MONOTONIC. Converted via `phc2sys` / the PTP system-offset query (needs well under 1 ms).
 - **Edge without frame** = drop: gap recorded (manifest, health, event), index never reused. **Frame without edge** = spurious: flagged.
-- **Second check point, the encoder output:** every frame enters the encoder with a unique PTS (its trigger time); `nodecap` keeps a table PTS -> `{session, index}`. A PTS missing at the output = gap, a repeated PTS = duplicate. Needed because Wave5 was observed to lose and repeat a timestamp at stream start (P-1).
+- **Second check point, the encoder output:** every frame enters the encoder with a unique PTS = edge time − T0 (DL-15); at the output, index = `round(PTS / period)`, looked up in a table index -> `{session, edge time, flags}`. Index missing = gap, repeated = duplicate, no table entry = frame without edge. Needed because Wave5 was observed to lose and repeat a timestamp at stream start (P-1). **Implemented** in `nodecap`.
 - With a camera: the **sensor frame counter** must also advance by 1 per matched pair (third check).
-- Test source: frames are created from edges, so binding is by construction; drops and duplicates are **injected on purpose** to test detection.
-- SEI per frame (`user_data_unregistered`, our UUID): `{session, index, t_edge}`. A segment file copied anywhere still proves its own timing and gaps.
+- Test source: frames are created from edges, so binding is by construction; drops are **injected on purpose** (`trigd --test-skip`) to test detection. Each test frame also carries its index **drawn into the picture** (DL-17), so a decoded frame proves its SEI sits on the right frame.
+- SEI per frame (prefix SEI, `user_data_unregistered`, our UUID; inserted by our code before the first slice, DL-16): `{version, session, flags, index, t_edge}`. A segment file copied anywhere still proves its own timing and gaps. Checked on the laptop by `sei-dump` (one SEI per frame, continuity, drawn index = SEI index).
 
 ---
 
@@ -175,7 +178,7 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 | Process | Language | Role |
 |---|---|---|
-| `trigd` | C | arms CPTS GENF at T0, reads HW_TS_PUSH events, computes indices, publishes `{index, t_edge}` |
+| `trigd` | C | arms CPTS GENF at T0, reads HW_TS_PUSH events, computes indices, publishes `{index, t_edge}`. **v1 done:** computed edge times until G1 is closed |
 | `nodecap` + `recorder` | C, **one process** | GStreamer pipeline (elements [TI]); matching, drop detection, SEI insertion; segments, manifest, ring, locks (separate module) |
 | `nodeagent` | C | control interface (§6) on `libmicrohttpd`, segment fetch |
 | `ptp4l`, `phc2sys` | linuxptp | time |
@@ -342,7 +345,7 @@ Another node may use entirely different code for camera, ISP, encode and timing.
 ## 9. Build and deploy
 
 - **Image:** Yocto scarthgap, TI config `processor-sdk-analytics-11.02.02` + our layer `meta-fwtrial` (services, configs, overlay, driver), pinned with kas.
-- **Now (bench):** cross-compile with the installed SDK (`linux-devkit/environment-setup-aarch64-oe-linux`) and copy to the board running the 11.0 image (user space compatible, §1.2).
+- **Now (bench):** cross-compile with the installed SDK via the CMake toolchain file and copy to `/tmp` on the board running the 11.0 image (user space compatible, §1.2). Commands and check scripts: `docs/setup.md` §8.
 - **Build system: CMake** (DL-05): laptop build for unit tests, board cross-build via `cmake/j722s-sdk.cmake` (SDK compiler + sysroot); zcbor code regenerated from the `.cddl`; `ctest`; Yocto `cmake` class later.
 - **Kernel work** (overlay, driver) needs the matching kernel: install the SDK 6.12.57 kernel + modules + DTBs, or flash a fresh 11.02 image to a spare SD.
 - **Update/rollback:** A/B rootfs on eMMC (§5.7), boot counting in U-Boot (e.g. RAUC). **TBD**.
@@ -354,7 +357,7 @@ Another node may use entirely different code for camera, ISP, encode and timing.
 
 ### 10.1 Measurements on this node
 
-Full list with commands: `~/logs/0004-measurements-to-do.txt`.
+Full list with commands: the bench measurement log (`0004-measurements-to-do.txt`, kept outside the repo).
 
 | # | What | Needs |
 |---|---|---|
@@ -388,20 +391,20 @@ Full list with commands: `~/logs/0004-measurements-to-do.txt`.
 
 ### 11.1 Components and critical path
 
-| # | Component | Camera needed? |
-|---|---|---|
-| A1 | Encode pipeline (test video -> Wave5) | no |
-| A2 | `trigd`: CPTS edges + hardware timestamps | no |
-| A3 | Trigger-driven test source | no |
-| A4 | SEI per frame | no |
-| A5 | Recorder: segments, manifest, ring, locks | no |
-| A6 | Query/fetch | no |
-| A7 | `nodeagent` control interface | no |
-| A8 | Matching + drop detection | no |
-| A9 | Node simulator + conformance tests | no |
-| A10 | Soak and fault tests | no |
-| A11 | PTP with the laptop | no |
-| B1-B5 | Sensor driver, overlay, ISP path, real binding, strobe measurement | yes |
+| # | Component | Camera needed? | Status (2026-11-13) |
+|---|---|---|---|
+| A1 | Encode pipeline (test video -> Wave5) | no | **done** (`nodecap`, board) |
+| A2 | `trigd`: CPTS edges + hardware timestamps | no | **v1 done:** hardware edges, computed times (G1) |
+| A3 | Trigger-driven test source | no | **done** (drawn index) |
+| A4 | SEI per frame | no | **done** (+ `sei-dump`) |
+| A5 | Recorder: segments, manifest, ring, locks | no | next |
+| A6 | Query/fetch | no | open |
+| A7 | `nodeagent` control interface | no | open |
+| A8 | Matching + drop detection | no | **encoder-output check done**; camera-side matching with B |
+| A9 | Node simulator + conformance tests | no | open |
+| A10 | Soak and fault tests | no | open; check scripts exist (`tests/*-check.sh`) |
+| A11 | PTP with the laptop | no | bench check done (P-3); gPTP config open |
+| B1-B5 | Sensor driver, overlay, ISP path, real binding, strobe measurement | yes | blocked (G3) |
 
 - **Order:** A2 -> A1 + A3 + A4 -> A5 + A6 -> A7, A8 -> A10 -> A9 / A11.
 - **Critical path for real video:** camera connected -> driver + overlay -> ISP -> binding. B replaces A3; everything else stays.
@@ -443,3 +446,4 @@ Full list with commands: `~/logs/0004-measurements-to-do.txt`.
 |---|---|---|---|---|
 | G1 | **No GENF -> timestamp-input route on the current image.** The board's 11.0 device tree has no timesync router node and no `ti,pps`; the GENF1 -> HW3_TS_PUSH loop exists only in the 11.02 SDK EVM tree. Without it, `trigd` cannot timestamp its own edges. | Pre-coding check P-2: periodic output 1 ran, but no events arrived on any of the 4 timestamp inputs; the live device tree confirmed the missing router. | **Device-tree overlay** on the unmodified base tree, loaded by U-Boot (`name_overlays`): adds the timesync router (`reg-mux`) with `mux-reg-masks-state = <0x34 0x0001ffff 0x10011>` (output 12 = HW3_TS_PUSH <- input 17 = GENF1), without `ti,pps` so `trigd` owns GENF1. Board kernel supports it (`CONFIG_MUX_MMIO=y`, TI `mux-reg-masks-state` extension present). Source: `dts/k3-j722s-evm-fwtrial-cpts-loop.dtso`, not yet deployed. Rejected: booting a decompiled live tree (bakes in U-Boot fixups, replaces the reference tree), the 11.02 kernel (larger change), a physical wire (board modification). | `trigd` runs in **computed-time** mode (`t_k = T0 + k·period`). Edges are still generated in hardware on PTP time, but M4 (jitter) and per-edge proof that each edge fired need **measured** mode, i.e. the overlay. Downstream code is unaffected: it only sees `{session, index, t}`. |
 | G2 | **Absolute PTP accuracy not measured; bench grandmaster is a weak clock.** P-3 measured offset and stability (30 ns RMS), but PTP cannot see one-sided delays: part of the +7.5 µs path delay may be asymmetric latency inside the laptop's NIC, which would leave a constant offset of up to a few µs. The laptop's Intel I219 clock runs ~1600 ppm off and only works as grandmaster with `phc2sys`. P-3 used the default 1588 settings, not the gPTP profile. | P-3: the first run (without `phc2sys`) failed (board frequency pinned at the +488 ppm limit, negative path delay); comparing each clock to its own NTP-synced system clock identified the laptop. | Keep the laptop + `phc2sys` as bench grandmaster; report jitter and stability as **measured**, absolute alignment as **not measured**. Product: a real grandmaster, time-aware switches, gPTP profile, one-time calibration per hardware type against PPS + scope (DL-01). | No effect on a single node: its edges, timestamps and indices are consistent on its own clock. Matters only for cross-node alignment (described, not shown). |
+| G3 | **Camera not detected.** The bench AR0234 module answers on no EVM camera connector; the image has no AR0234 driver or overlay (only IMX219, OV5640). | Board side checked: connector mux, enable pins (GPIO mode, driven high), I/O level 3.3 V (SW2.4), trace mode off, pinout = Raspberry Pi 22-pin; I2C scan of all four connector buses finds nothing. | Remaining causes are physical: cable type, module pinout, power at the module. Next: multimeter at the module, other cable type, module documentation, or a known-good Raspberry Pi camera (IMX219) to prove the board path. | Slice runs on the trigger-driven test source (DL-10). Even once detected: driver port + overlay, build against the board kernel (6.12.17) or move to 11.02, ISP tuning (colour). |
