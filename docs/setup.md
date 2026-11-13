@@ -328,7 +328,72 @@ curl -s -D - -o last10.h265 "$U/fetch?session=12345&last_s=10" | grep X-Fwt
 build-host/src/tools/sei-dump/sei-dump -q last10.h265
 ```
 - Laptop run: see `tests/nodeagent-check.sh` (`run_host`) for the options (`--trigd-args "--clock sys"`, `--nodecap-args "--enc x265 ..."`, `--ptp none`, temp sockets).
-- After an ICD change: `src/nodeagent/gen.sh` regenerates the C code (laptop venv), then rebuild.
+- After an ICD change: regenerate the C code (§8.5), then rebuild.
+
+### 8.5 Regenerate the CBOR code (after an ICD change)
+
+The node's CBOR encode/decode code is **generated** from the contract `icd/fwt-icd-v1.cddl` by zcbor (DL-03) and **committed** in `src/nodeagent/gen/`, together with zcbor's small C runtime. The board build compiles it into `nodeagent`: no CBOR library and no Python on the node. The generator runs on the laptop only.
+
+| File in `src/nodeagent/gen/` | What |
+|---|---|
+| `icd_encode.c/.h`, `icd_decode.c/.h` | generated: one encode and one decode function per message (`cbor_encode_health`, `cbor_decode_arm_req`, ...) |
+| `icd_types.h` | generated: one C struct per message |
+| `zcbor_common/encode/decode/print.c/.h`, `zcbor_tags.h` | zcbor's C runtime, copied by the generator |
+
+**When:** after any change to `icd/fwt-icd-v1.cddl`. Never edit the generated files by hand.
+
+**Check the generator** (laptop venv, §2.4; zcbor version pinned in `tools-requirements.txt`):
+```sh
+cd ~/Dima_CoWork && \
+.venv/bin/zcbor --version
+```
+Expected: `zcbor 0.9.1` (the generated files name the version in their first lines).
+
+**Regenerate:**
+```sh
+cd ~/Dima_CoWork && \
+src/nodeagent/gen.sh
+```
+The script runs exactly this (paths from the repo root):
+```sh
+cd src/nodeagent/gen && \
+../../../.venv/bin/zcbor code \
+  -c ../../../icd/fwt-icd-v1.cddl \
+  -b 64 --default-max-qty 512 \
+  -t error ok-rep identity health arm-req arm-rep session-rep \
+     sessions-rep segments-rep lock-req lock-rep unlock-req \
+  -d -e \
+  --oc icd.c --oh icd.h --oht icd_types.h \
+  --copy-sources
+```
+- `-c`: the contract. `-b 64`: 64-bit integers (ns times, indices). `--default-max-qty 512`: longest list = page size of sessions/segments.
+- `-t`: the messages that get functions; **a new message type must be added here** (in `gen.sh`).
+- `-d -e`: decode and encode (files get `_decode` / `_encode`). `--oht`: shared types. `--copy-sources`: copy the zcbor runtime.
+
+**Review what changed:**
+```sh
+git diff --stat src/nodeagent/gen && \
+git diff src/nodeagent/gen/icd_types.h
+```
+Expected: only the messages you changed; the runtime files unchanged (same zcbor version).
+
+**Rebuild and check:**
+```sh
+cmake --build build-host -j && \
+ctest --test-dir build-host --output-on-failure && \
+tests/nodeagent-check.sh host
+```
+```sh
+tests/nodeagent-check.sh dev root@10.42.0.132
+```
+Then adapt `src/nodeagent/main.c` to new or changed struct fields (the compiler points at them), and `tests/nodeagent-check.sh` to new endpoints.
+
+**Commit:** the CDDL, `gen.sh` (if changed) and `src/nodeagent/gen/` together, with the regenerate command in the message.
+
+**Rules from the generator:**
+- Map keys are encoded and expected **in the CDDL order**: clients send request keys in that order (`tools/icd-json to-cbor` keeps the order you write).
+- A message type name must not equal one of its own keys (`sessions = { "sessions" => ... }` fails: duplicate function name); hence `sessions-rep`.
+- Additive changes only within ICD version 1 (new optional fields, new messages); anything else is a new `icd/fwt-icd-v2.cddl`.
 
 Not yet: install paths, systemd units (DL-14), Yocto layer.
 
