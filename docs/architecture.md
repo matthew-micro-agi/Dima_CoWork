@@ -94,10 +94,17 @@ From TI SPRUJB5 (Fig. 2-1/2-2, Tables 2-6, 2-19):
 ## 3. Data path
 
 ```
-trigger-driven test source (now) │ AR023x -> CSI2RX3 -> v4l2src -> tiovxisp (camera, later)
-      -> NV12 1920x1200 -> v4l2h265enc (Wave5) -> h265parse -> appsink
+frame source:  test (one frame per edge, built in)
+             | emu  (cam-emu process, V4L2-like buffers; binding by time)
+             | AR023x -> CSI2RX3 -> V4L2 -> ISP (camera, later; same binding as emu)
+      -> appsrc -> NV12 1920x1200 -> v4l2h265enc (Wave5) -> h265parse -> appsink
       -> our code: SEI {session, index, t} + drop check -> recorder -> eMMC
 ```
+
+**Frame sources** (`nodecap --src`, DL-26), one interface shaped like a V4L2 capture device (fd to poll, dequeue a buffer with monotonic timestamp and sequence counter, release it):
+- `test`: frames made from edges, bound by construction; kept as a second path.
+- `emu`: `cam-emu`, a separate test process (not in the bundle) playing a triggered sensor: subscribes to `trigd`, delivers each frame at edge + latency ± jitter into shared-memory buffers the client queued (one memfd, passed over a Unix socket); no buffer queued -> frame lost, sequence still advances. Faults on request; the true index drawn into each frame (ground truth).
+- Later `v4l2`: the camera; same calls as `ioctl`s.
 
 **GStreamer** is the media framework [TI elements, standard framework] (DL-08):
 - **Now:** a thin pipeline; our code sits at `appsrc` (one frame per trigger edge) and `appsink`.
@@ -161,13 +168,17 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ### 4.4 Frame-to-trigger matching and drop detection [OURS]
 
-- `trigd` passes `{index, t_edge}` to `nodecap`. The edge event arrives before its frame (exposure + readout come first), so `nodecap` keeps a small queue of recent edges.
-- **Match by time, not by queue position:** frame ↔ edge k if `t_frame − t_edge(k) ≈ expected latency (± tolerance)`. The latency (exposure + readout + capture, tens of ms) is measured at start; edges are 16.7-33.3 ms apart, so the match is unambiguous.
-- Clocks: edges are in PHC time, V4L2 frames in CLOCK_MONOTONIC. Converted via `phc2sys` / the PTP system-offset query (needs well under 1 ms).
-- **Edge without frame** = drop: gap recorded (manifest, health, event), index never reused. **Frame without edge** = spurious: flagged.
+- `trigd` passes `{index, t_edge}` to `nodecap`. The edge event arrives before its frame (exposure + readout come first), so `nodecap` keeps a small list of undecided edges.
+- **Match by time, not by queue position (DL-27, implemented for `emu`):** a frame belongs to the edge whose `t_edge + latency` is nearest, within **± 3 ms** (`--cam-window-ms`; refused at ¼ period or more). Two frames for one edge: the nearer kept, the other spurious. An edge is decided once its window has passed (a later frame arrived, or max(4 periods, 100 ms) without frames).
+  - Latency configured (`--cam-latency-ms`, 25 ms); measured min/mean/max reported; warning when frames sit beyond half the window. Measuring it at start: later.
+  - Why not ± half a period: a frame ¾ period late lands ¼ period from the next edge and takes its index if that edge's frame is missing (seen in the emulator stress run).
+  - Limit: timing alone can't be fully safe (a stray frame exactly where a missing one belongs); the sensor frame counter is the real fix (below).
+- Clocks: edges are in PHC time, frames in CLOCK_MONOTONIC. Converted per edge: offset from bracketed reads of `/dev/ptp0` and CLOCK_MONOTONIC (best of 5), µs-level.
+- **Edge without frame** = drop: gap recorded (manifest, health, event), index never reused. **Frame without edge** = spurious: counted, not encoded. Camera sequence jumps counted next to gaps.
+- **Verified** with the emulator (`tests/camemu-check.sh`): board, 60 fps, 1920x1200, Wave5, 600 edges: clean 600/600 bound, latency 24.5-25.5 ms; with 3 % drop/extra/late faults every count matched the emulator's plan and no frame got a wrong index (drawn index = SEI index).
 - **Second check point, the encoder output:** every frame enters the encoder with a unique PTS = edge time − T0 (DL-15); at the output, index = `round(PTS / period)`, looked up in a table index -> `{session, edge time, flags}`. Index missing = gap, repeated = duplicate, no table entry = frame without edge. Needed because Wave5 was observed to lose and repeat a timestamp at stream start (P-1). **Implemented** in `nodecap`.
 - With a camera: the **sensor frame counter** must also advance by 1 per matched pair (third check).
-- Test source: frames are created from edges, so binding is by construction; drops are **injected on purpose** (`trigd --test-skip`) to test detection. Each test frame also carries its index **drawn into the picture** (DL-17), so a decoded frame proves its SEI sits on the right frame.
+- `test` source: frames are created from edges, so binding is by construction; drops are **injected on purpose** (`trigd --test-skip`) to test detection. Each test frame also carries its index **drawn into the picture** (DL-17), so a decoded frame proves its SEI sits on the right frame.
 - SEI per frame (prefix SEI, `user_data_unregistered`, our UUID; inserted by our code before the first slice, DL-16): `{version, session, flags, index, t_edge}`. A segment file copied anywhere still proves its own timing and gaps. Checked on the laptop by `sei-dump` (one SEI per frame, continuity, drawn index = SEI index).
 
 ---
@@ -386,6 +397,7 @@ Full list with commands: the bench measurement log (`0004-measurements-to-do.txt
 | M8 | Ring reclaim and lock vs reclaim (small ring, wraps in ~13 min) | recorder |
 | M9 | "Last 90 s" query time with a full manifest | recorder + fetch |
 | M10 | Recovery: power pull, Ethernet unplug, process kill | recorder + nodeagent |
+| M11 | Binding by time with the camera emulator (60 fps, faults) | `cam-emu`; **done** |
 
 ### 10.2 Multi-camera sync: what is shown vs described
 

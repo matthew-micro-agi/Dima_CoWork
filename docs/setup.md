@@ -254,12 +254,14 @@ cmake --build build-board -j
 | | `dev <user@node>` | cross-build, copy to `/tmp`; same scenario on the board with Wave5: main run into `/rec`, crash and ring runs in `/rec/check-crash`, `/rec/check-ring` (recreated each run) |
 | `tests/nodeagent-check.sh` | `host` | build, unit tests; `nodeagent` on port 18080 (temp recordings, system clock, x265 960x600), driven with `curl` + `tools/icd-json`: identity, arm (+ busy), lock and health while recording, fetch while recording, disarm, sessions, segments, fetch last 5 s and whole session -> `sei-dump`, unlock, error replies |
 | | `dev <user@node>` | laptop + board builds; `nodeagent` started on the board (port 8080, `/rec`, Wave5, PTP clock); same scenario over the network; `nodeagent` stopped at the end |
+| `tests/camemu-check.sh` | `host` | build, unit tests; `trigd` + `cam-emu` + `nodecap --src emu` (x265, 960x600, **30 fps**), 600 edges: clean run; faults (drop/extra/late/sequence jump) whose counts must match the emulator's plan; window of ¼ period refused; ±2 ms jitter warns; emulator killed mid-session -> gaps, no hang. `sei-dump` pixel check on each stream: no frame bound to a wrong edge |
+| | `dev <user@node>` | laptop + board builds; clean and fault runs on the board at **60 fps**, 1920x1200, Wave5, PTP clock; streams copied back, `sei-dump` here; the emulator must keep real time (delivery lag < one period) |
 
 ```sh
 tests/trigd-check.sh host
 tests/nodecap-check.sh dev root@10.42.0.132
 ```
-Laptop runs use 960x600: the laptop's software encoder can't hold 30 fps at 1920x1200 and drops frames. The board runs full resolution.
+Laptop runs use 960x600: the laptop's software encoder can't hold 30 fps at 1920x1200 and drops frames. The board runs full resolution. `camemu-check` runs the laptop at 30 fps: x265 can't keep up with the emulator's noisy frames at 60 fps.
 
 **Verify:** each ends with `ALL PASSED (<mode>)`. Every step prints PASS/FAIL with the compared values; full logs in the `/tmp/<name>-check.XXXXXX` directory named at the end. Nothing is installed on the board (binaries and output in `/tmp`, a RAM disk).
 
@@ -292,6 +294,40 @@ build-host/src/tools/sei-dump/sei-dump -q --frames 300 nc.h265
 - `trigd --help`, `nodecap --help`: options (clock, fps, T0 offset, count, encoder, bitrate, level, `--enc-extra` for extra Wave5 controls; recorder: `--rec`, `--ring-max-mb`, `--seg-seconds`, `--lock-cap-pct`, `--ctl-sock`).
 - `rec-tool lock/unlock` go to the running recorder over `/run/fwtrial/rec.sock`; with no recorder running, `rec-tool` opens `/rec` itself.
 - `nodecap` needs `trigd` running first; both stop at `trigd`'s END (`--count`) or Ctrl-C.
+
+**Camera emulator** (test tool, not in the bundle; DL-26, DL-27). Start order: `cam-emu`, `trigd`, then `nodecap --src emu`. The emulator draws the true index into every frame; `sei-dump`'s pixel check then proves each frame got the right index by timing.
+```sh
+# laptop: 600 edges @30 fps with faults, system clock, x265
+mkdir -p /tmp/ce && rm -f /tmp/ce/*.sock; \
+build-host/src/tools/cam-emu/cam-emu --clock sys \
+  --sock /tmp/ce/emu.sock --trigd /tmp/ce/trigd.sock --once \
+  --truth /tmp/ce/truth.csv \
+  --drop 3 --extra 3 --late 3 --seq-jump 2 --seed 11 & \
+build-host/src/trigd/trigd --session $((RANDOM * 32768 + RANDOM + 1)) --clock sys \
+  --sock /tmp/ce/trigd.sock --fps 30 --count 600 --t0-offset-ms 1500 & \
+sleep 0.5; \
+build-host/src/nodecap/nodecap --src emu --cam-sock /tmp/ce/emu.sock \
+  --clock sys --sock /tmp/ce/trigd.sock --enc x265 \
+  --width 960 --height 600 --out /tmp/ce/out.h265 -q; \
+wait; \
+build-host/src/tools/sei-dump/sei-dump -q /tmp/ce/out.h265
+```
+```sh
+# board (binaries copied to /tmp, installed service stopped): 600 edges @60 fps, Wave5
+mkdir -p /tmp/ce && rm -f /tmp/ce/*.sock; \
+/tmp/cam-emu --sock /tmp/ce/emu.sock --trigd /tmp/ce/trigd.sock \
+  --once --truth /tmp/ce/truth.csv >/tmp/ce/emu.log 2>&1 & \
+/tmp/trigd --session $((RANDOM * 32768 + RANDOM + 1)) --sock /tmp/ce/trigd.sock \
+  --fps 60 --count 600 --t0-offset-ms 1500 >/dev/null 2>&1 & \
+sleep 0.5; \
+/tmp/nodecap --src emu --cam-sock /tmp/ce/emu.sock \
+  --sock /tmp/ce/trigd.sock --enc v4l2 --out /tmp/ce/out.h265 -q; \
+wait; tail -1 /tmp/ce/emu.log
+```
+- `cam-emu` options: `--latency-ms` (25), `--jitter-ms` (0.5), faults in %: `--drop`, `--extra`, `--late` (¾ period late), `--seq-jump`; `--noise`, `--seed`, `--truth FILE` (per frame: sequence, timestamp, true index, kind, delivery lag), `--once` (exit at `trigd`'s END).
+- `nodecap --src emu` options: `--cam-sock`, `--cam-bufs` (4), `--cam-latency-ms` (25), `--cam-window-ms` (3; must be < ¼ period), `--clock phc|sys`, `--dev`.
+- Reading results: `nodecap`'s `camera:` line (bound, spurious, edges without frame, sequence jumps, latency min/mean/max, frames beyond half the window); `cam-emu`'s `summary:` line (planned faults, delivered, max delivery lag); `sei-dump` `pixels ok` = no frame bound to a wrong edge. With faults: edges without frame = dropped + late; spurious = extra + late.
+- At the end, `nodecap` prints `frame source emu stopped` when `cam-emu --once` exits after its last frame: normal there.
 
 ### 8.4 Control interface (nodeagent)
 
