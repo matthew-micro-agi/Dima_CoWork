@@ -205,6 +205,70 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ## 5. Software on the node
 
+### 5.0 Components and interfaces (as built)
+
+Tags: [OURS] our code, [TI] SoC/SDK, [EVM] this board, [linuxptp] standard tool. "(later)" = designed, not running on the bench.
+```
+                LAPTOP (bench stand-in for the controller and the operator's PC)
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  fwt-rec, curl + icd-json          deploy.sh, fwt-doctor        phc2sys + ptp4l     │
+│  record, status, lock, fetch       install, checks (ssh)        PTP grandmaster     │
+└─────────────────┬──────────────────────────────────────────────────────┬────────────┘
+                  │ HTTP + CBOR (ICD v1, port 8080)                       │ PTP (gPTP)
+══════════════════╪═══════════════════════════════════════════════════════╪══════════════
+J722S EVM         │ eth0                                                  │ eth0
+LINUX (A53)       ▼                                                       ▼
+          ┌───────────────────────────────┐                   ┌─────────────────────┐
+          │ nodeagent [OURS]              │                   │ ptp4l [linuxptp]    │
+          │ fwtrial-nodeagent.service     │                   │ fwtrial-ptp4l       │
+          │ arm/disarm, health, sessions, │                   │ client only         │
+          │ segments, fetch, locks        │                   └──────────┬──────────┘
+          └──┬───────────┬──────────▲─────┘                              │
+   starts    │  starts   │ locks    │ reads manifest + segments          │ steers
+   per       │  per      │ (rec.    │ (read-only, DL-22)                 │ the PHC
+   session   │  session  │  sock)   │                                    │
+             ▼           ▼          │                                    │
+┌──────────────────┐   ┌────────────┴─────────────────────────────┐      │
+│ trigd [OURS]     │   │ nodecap [OURS]      (+ recorder library) │      │
+│ programs the     │(1)│ frame source: test | emu (2) | v4l2      │      │
+│ periodic output  │──►│ bind frame -> edge by time (±3 ms)       │      │
+│ once; reads each │   │ appsrc -> v4l2h265enc -> h265parse ->    │      │
+│ edge's captured  │   │   appsink: index from PTS (2nd check)    │      │
+│ time; --edges    │   │ SEI {session, k, flags, t} per frame     │      │
+│ auto | measured  │   │ write queue -> writer thread -> recorder │      │
+│ | computed       │   └──────┬──────▲────────────────────┬───────┘      │
+└───┬──────────▲───┘          │      │                    │              │
+    │ PEROUT   │ EXTTS        │ NV12 │ H.265              │ segments,    │
+    │ (once)   │ events       │      │                    │ manifest     │
+────┼──────────┼──────────────┼──────┼────────────────────┼──────────────┼─────────────
+HW  ▼          │              ▼      │                    ▼              ▼
+┌──────────────┴───────┐   ┌─────────┴────────┐   ┌──────────────────┐  CPTS clock
+│ CPTS [TI]            │   │ Wave5 [TI]       │   │ eMMC [EVM]       │  (PHC, /dev/ptp0):
+│ periodic output GENF1│   │ H.265 encoder    │   │ /rec: segments   │  the CPTS on the
+│  -> timesync router  │   │ /dev/video1      │   │ sNNNNNNNNNN/,    │  left
+│  (our overlay, G1)   │   └──────────────────┘   │ manifest.bin,    │
+│  -> HW3_TS_PUSH:     │                          │ ring + locks     │
+│  edge time captured  │                          └──────────────────┘
+│ GENF -> J1 pin 18:   │
+│  not routed yet      │
+└──────────┬───────────┘
+           │ trigger edge (later)
+           ▼
+┌──────────────────────┐    ┌──────────────┐    ┌──────────────────────────┐
+│ sensor on J1 [EVM]   │───►│ CSI2RX [TI]  │───►│ ISP: VPAC via TIOVX on   │───► nodecap
+│ AR0234: blocked, no  │CSI │ V4L2, stamps │RAW │ R5F + C7x [TI] (later)   │     source v4l2
+│ I2C answer (P7)      │ -2 │ MONOTONIC    │    │ Bayer -> NV12            │     (later)
+└──────────────────────┘    └──────────────┘    └──────────────────────────┘
+
+(1) EDGE {session, k, t, flags} per edge over /run/fwtrial/trigd.sock (DL-11); t = the edge's
+    captured PTP time (flags: TS_MISSING if its event was lost, COMPUTED without the overlay).
+(2) emu = cam-emu [OURS, tests only, not deployed]: subscribes to the same EDGE messages and
+    plays a triggered sensor (frame at edge + latency, V4L2-like buffers, DL-26).
+```
+- **Timing path:** `trigd` programs the CPTS once; the hardware fires every edge at T0 + k·P and captures its time; `trigd` reads the captures and publishes one message per edge (§4.1).
+- **Video path:** frame source -> `nodecap` binds each frame to its edge by time -> Wave5 -> SEI with index and edge time -> write queue -> recorder on the eMMC (§3, §4.4, §5.2-5.4). Storage latency never blocks capture (writer thread, M12).
+- **Control path:** `nodeagent` is the only long-running process of ours; it starts `trigd` + `nodecap` per session, serves the ICD, reads the recordings read-only, sends locks to the running recorder (§5.5, §6).
+
 ### 5.1 Processes [OURS unless noted]
 
 | Process | Language | Role |
