@@ -57,6 +57,7 @@ SIZE=""      # nodecap frame size
 ENC=""       # nodecap encoder
 FPS=""
 RUN=""       # "local" or "ssh"
+REC=""       # recorder directory of the clean run (board: on the eMMC, where syncs are slow)
 
 setup_host() {
 	X="$LOG/bin"
@@ -68,6 +69,7 @@ setup_host() {
 	ENC="--enc x265"
 	FPS=30
 	RUN=local
+	REC="$LOG/rec"
 }
 
 setup_dev() {
@@ -80,6 +82,7 @@ setup_dev() {
 	ENC="--enc v4l2"
 	FPS=60
 	RUN=ssh
+	REC=/rec/check-camemu
 	echo "== copy to $NODE:/tmp"
 	scp -q "$BB/trigd/trigd" "$BB/tools/cam-emu/cam-emu" "$BB/nodecap/nodecap" "$NODE:/tmp/" &&
 		ssh -o BatchMode=yes "$NODE" "rm -rf $W; mkdir -p $W" &&
@@ -140,9 +143,15 @@ check_stream() {
 	expect_rc "$1 sei-dump" $rc "$3"
 }
 
+# Clean run with the recorder on: storage stalls (eMMC syncs up to ~0.7 s)
+# must never cost a camera frame (write queue, soak finding 2026-11-13).
 run_clean() {
-	echo "== clean: $EDGES edges, $FPS fps, no faults"
-	run_emu clean $EDGES "" ""
+	echo "== clean: $EDGES edges, $FPS fps, no faults, recorder on ($REC)"
+	remote "rm -rf $REC; mkdir -p $REC"
+	run_emu clean $EDGES "" "--rec $REC --ring-max-mb 300 --ctl-sock $W/clean-rec.sock"
+	expect_line "clean recorder" "$LOG/clean.nc.log" "recorder:" recorded=$EDGES errors=0
+	expect_line "clean storage" "$LOG/clean.nc.log" "timing:" overflow=0
+	grep "^timing:" "$LOG/clean.nc.log" | sed 's/^/      /'
 	expect_line "clean emulator" "$LOG/clean.emu.log" "summary:" \
 		edges=$EDGES delivered=$EDGES lost_nobuf=0 lost_send=0
 	emu_realtime clean
