@@ -28,7 +28,8 @@ struct nc_match_cfg {
 	int64_t period_ns;
 	int64_t latency_ns;  /* expected edge -> frame timestamp */
 	int64_t window_ns;   /* accept +- this around edge + latency; <= 0: period / 2 */
-	int64_t grace_ns;    /* wait this long past a window without frames; <= 0: period */
+	int64_t grace_ns;    /* wait this long past a window without frames;
+			      * <= 0: max(4 periods, 100 ms) */
 };
 
 struct nc_medge {

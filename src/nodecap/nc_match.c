@@ -13,8 +13,9 @@ void nc_match_init(struct nc_match *m, const struct nc_match_cfg *cfg)
 	m->cfg = *cfg;
 	if (m->cfg.window_ns <= 0)
 		m->cfg.window_ns = cfg->period_ns / 2;
-	if (m->cfg.grace_ns <= 0)
-		m->cfg.grace_ns = cfg->period_ns;
+	if (m->cfg.grace_ns <= 0)  /* a camera may deliver a frame late */
+		m->cfg.grace_ns = cfg->period_ns * 4 > 100000000LL ? cfg->period_ns * 4
+								    : 100000000LL;
 	m->last_frame_mono = INT64_MIN;
 	m->st.lat_min = INT64_MAX;
 	m->st.lat_max = INT64_MIN;

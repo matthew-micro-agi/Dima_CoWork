@@ -92,9 +92,10 @@ static void test_decide_timing(void)
 	CHECK(frame(&m, 0, 0, 7, &idx, &disp) == NC_M_HELD);
 	/* a nearer frame could still come: not decided */
 	CHECK(!nc_match_take_decided(&m, T0 + LAT + P / 4, &d));
-	/* clock beyond window + grace (one period) */
-	CHECK(!nc_match_take_decided(&m, T0 + LAT + P / 2 + P - 1, &d));
-	CHECK(nc_match_take_decided(&m, T0 + LAT + P / 2 + P + 1, &d) && d.has_frame && d.tag == 7);
+	/* clock beyond window + grace (max(4 periods, 100 ms) = 100 ms at 60 fps) */
+	CHECK(!nc_match_take_decided(&m, T0 + LAT + P / 2 + 100 * MS - 1, &d));
+	CHECK(nc_match_take_decided(&m, T0 + LAT + P / 2 + 100 * MS + 1, &d) && d.has_frame &&
+	      d.tag == 7);
 	CHECK(d.t_ns == 5000 * MS && d.session == 3);
 
 	/* a frame past the window decides it at once */
