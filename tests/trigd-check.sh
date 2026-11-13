@@ -12,51 +12,17 @@ set -u
 
 MODE=${1:-}
 NODE=${2:-}
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FAILS=0
-LOG=$(mktemp -d /tmp/trigd-check.XXXXXX)
+NAME=trigd-check
+. "$(dirname "$0")/check-lib.sh"
 
 usage() {
 	echo "usage: $0 host | dev <user@node>" >&2
 	exit 2
 }
 
-pass() { echo "PASS  $1"; }
-fail() { echo "FAIL  $1"; FAILS=$((FAILS + 1)); }
-
-# summary_field <file> <field>: number after "<field> " in trig-listen's summary line
-summary_field() {
-	grep '^summary:' "$1" | tail -1 | sed -n "s/.*[ ,(]$2 \([0-9-]*\).*/\1/p"
-}
-
 # check_listen <name> <file> <edges> <gaps>: edges/gaps as expected, no duplicates
 check_listen() {
-	local e g d
-	e=$(summary_field "$2" edges)
-	g=$(summary_field "$2" gaps)
-	d=$(summary_field "$2" duplicates)
-	if [ "$e" = "$3" ] && [ "$g" = "$4" ] && [ "$d" = "0" ]; then
-		pass "$1 (edges $e, gaps $g, duplicates $d)"
-	else
-		fail "$1 (edges ${e:-?} want $3, gaps ${g:-?} want $4, duplicates ${d:-?} want 0; see $2)"
-	fi
-}
-
-build_host() {
-	echo "== host build + unit tests"
-	cmake -S "$ROOT" -B "$ROOT/build-host" >"$LOG/cmake-host.log" 2>&1 &&
-		cmake --build "$ROOT/build-host" -j >>"$LOG/cmake-host.log" 2>&1 ||
-		{ fail "host build (see $LOG/cmake-host.log)"; return 1; }
-	if grep -q "warning:" "$LOG/cmake-host.log"; then
-		fail "host build has warnings (see $LOG/cmake-host.log)"
-	else
-		pass "host build, no warnings"
-	fi
-	if ctest --test-dir "$ROOT/build-host" --output-on-failure >"$LOG/ctest.log" 2>&1; then
-		pass "unit tests ($(grep -o '[0-9]*% tests passed.*' "$LOG/ctest.log" | head -1))"
-	else
-		fail "unit tests (see $LOG/ctest.log)"
-	fi
+	expect_fields "$1" "$2" edges="$3" gaps="$4" duplicates=0
 }
 
 run_host() {
@@ -92,17 +58,6 @@ run_host() {
 	grep -q "2 subscriber(s)" "$LOG/h3-trigd.log" && ! grep -q "dropped [1-9]" "$LOG/h3-trigd.log" &&
 		pass "host: trigd saw 2 subscribers, no drops" ||
 		fail "host: trigd subscribers/drops (see $LOG/h3-trigd.log)"
-}
-
-build_dev() {
-	echo "== board cross-build"
-	cmake -S "$ROOT" -B "$ROOT/build-board" -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/j722s-sdk.cmake" \
-		>"$LOG/cmake-board.log" 2>&1 &&
-		cmake --build "$ROOT/build-board" -j >>"$LOG/cmake-board.log" 2>&1 ||
-		{ fail "board build (see $LOG/cmake-board.log)"; return 1; }
-	grep -q "warning:" "$LOG/cmake-board.log" &&
-		fail "board build has warnings (see $LOG/cmake-board.log)" ||
-		pass "board build, no warnings"
 }
 
 run_dev() {
@@ -152,10 +107,4 @@ dev)
 	;;
 esac
 
-echo
-if [ $FAILS -eq 0 ]; then
-	echo "ALL PASSED ($MODE). Logs: $LOG"
-	exit 0
-fi
-echo "$FAILS FAILED ($MODE). Logs: $LOG"
-exit 1
+finish "$MODE"
