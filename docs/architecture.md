@@ -248,7 +248,7 @@ Keyframe (IDR) every 1 s (**TBD**: 1 or 2 s); every segment starts with a keyfra
 
 ### 5.7 eMMC layout
 
-- **Trial** (boots from SD): `mmcblk0p1` = `/rec`, whole eMMC (~29.6 GB). The existing p1/p2 are wiped (confirm with Matthew first).
+- **Trial** (boots from SD): `mmcblk0p1` = `/rec`, whole eMMC (~29.6 GB): wiped 2026-11-13, one GPT partition, ext4 labelled `rec`, mounted via `fstab` (`noatime`, `nofail`). Measured (`dd`, sanity check only): read 173 MB/s, write 96.5 MB/s sequential; 4 KiB writes 36.6 MB/s. Need: 0.6-1.2 MB/s.
 - **Product** (boots from eMMC):
 
 | Area | Size | Content |

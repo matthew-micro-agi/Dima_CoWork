@@ -182,9 +182,42 @@ Notes:
 
 ---
 
-## 6. eMMC `/rec` partition (NOT YET)
+## 6. eMMC `/rec` partition
 
-Planned (`architecture.md` §5.7): wipe `mmcblk0p2`, format as ext4 labelled `rec`, mount at `/rec`, add an `fstab` entry. Destructive; to be written when done.
+The whole eMMC becomes one partition for recordings (`architecture.md` §5.7). Done on the bench 2026-11-13.
+
+**Check first (read-only):** root must be on the SD card (`mmcblk1`); tools present.
+```sh
+ssh root@10.42.0.132 \
+  'lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS /dev/mmcblk0 /dev/mmcblk1; \
+   echo "root: $(findmnt -n -o SOURCE /)"; \
+   command -v sfdisk wipefs mkfs.ext4'
+```
+
+**Wipe, partition, format (destructive, irreversible):** one GPT partition over the whole device, ext4 labelled `rec`. Aborts if root is not on the SD card. The image automounts eMMC partitions under `/run/media/…`; they are unmounted first.
+```sh
+ssh root@10.42.0.132 \
+  'set -e; \
+   findmnt -n -o SOURCE / | grep -q mmcblk1; \
+   for p in /dev/mmcblk0p*; do umount "$p" 2>/dev/null || true; done; \
+   wipefs -a /dev/mmcblk0p* /dev/mmcblk0; \
+   printf "label: gpt\n,,L\n" | sfdisk --wipe always /dev/mmcblk0; \
+   sleep 1; \
+   mkfs.ext4 -F -L rec \
+     -E lazy_itable_init=0,lazy_journal_init=0 /dev/mmcblk0p1; \
+   lsblk -o NAME,SIZE,FSTYPE,LABEL /dev/mmcblk0'
+```
+`lazy_*_init=0`: no background initialisation afterwards that would skew write measurements.
+
+**Mount at `/rec`, permanently** (by label; `nofail` so a missing eMMC never blocks boot):
+```sh
+ssh root@10.42.0.132 \
+  'mkdir -p /rec; \
+   grep -q "^LABEL=rec " /etc/fstab || \
+     echo "LABEL=rec /rec ext4 defaults,noatime,nofail 0 2" >> /etc/fstab; \
+   umount /dev/mmcblk0p1 2>/dev/null; mount /rec && df -h /rec'
+```
+**Verify:** `lsblk` shows `mmcblk0p1 29.6G ext4 rec`; `df -h /rec` shows ~28 GB available, also after a reboot.
 
 ---
 
