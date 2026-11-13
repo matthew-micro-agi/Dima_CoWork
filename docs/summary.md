@@ -14,8 +14,19 @@ One PTP time base on every node -> one plan `{session, T0, P}` to all nodes -> e
 - **Time:** PTP client at boot; 51-52 ns RMS to the bench grandmaster over 30 min.
 - **Binding by time:** frames bound to edges by timestamp with a ±3 ms window; under injected faults (drop, extra, late, sequence jumps) every count matched and no frame got a wrong index.
 - **Recorder:** 4 s segments, append-only manifest with CRC, ring, locks with a cap, crash recovery; "last 90 s" (~113 MB) fetched in ~1 s with the first byte in ~2 ms while recording and reclaiming.
-- **Control interface:** HTTP + CBOR, the contract in CDDL (`icd/fwt-icd-v1.cddl`), C code generated with zcbor; a C client `fwt-rec` (record, status, fetch, check) that is also the start of the controller code.
+- **Control interface as a testable contract:** the contract is a CDDL file (`icd/fwt-icd-v1.cddl`), not prose; the node's server and the C client `fwt-rec` both use C code generated from it (zcbor), and the tests check them against an independent CBOR implementation (cbor2): two implementations already agree on the contract, the basis for the conformance suite that makes other nodes interchangeable (architecture §6, §8). `fwt-rec` (record, status, fetch, check) is also the start of the controller code.
 - **Operations:** one-command deploy with rollback and uninstall, systemd services, a host bundle for operators (no build tools); see §3.
+
+The numbers the brief asks for (details and how to repeat them: `numbers.md`):
+
+| Number | Result |
+|---|---|
+| Sustained bitrate | ~9.4 Mbps at a 10 Mbps target, 60 fps, 1920x1200, over 30 min |
+| CPU load | 34.7 % of one A53 core (8.7 % of four) for our processes |
+| Frames captured vs dropped, 30 min | 108,001 of 108,001, 0 dropped, 0 with a wrong index |
+| Write throughput | needed 1.2 MB/s, available 96 MB/s; the real limit is sync latency (up to 1.2 s), absorbed by the write queue without a lost frame |
+| Trigger interval jitter | interval = period within the 2 ns resolution; with PTP correcting the frequency the edges drift 57 ppm off PTP time (G4, driver fix planned) |
+| Recovery when something is unplugged | **not measured** (power pull, Ethernet unplug); process kill and recorder crash recovery are tested |
 
 ## 3. How it's tested and integrated
 
@@ -55,6 +66,8 @@ What the tests found: the storage stall (soak 1 + timing counters), the start-up
 
 ## 6. Found on the way (the useful surprises)
 
+Four times a measurement disproved an assumption and the design changed: the binding window, storage on the capture path, odd periods, edges following PTP.
+
 | Finding | Effect |
 |---|---|
 | A 5 V USB-A supply resets the board when Linux loads drivers | 65 W USB-C PD required (setup §1) |
@@ -84,3 +97,13 @@ From architecture §11.2; each step unblocks the next. Time frames (draft): 1 mo
 6. **Lite tier:** RV1106 + supervisor MCU as edge source; time base chosen by the sync budget.
 
 Alongside: a **security track** (threat model first; authentication and network hardening with several nodes; secure boot, signed updates, identity and encrypted recordings with the product platform), a richer camera emulator and a CI / hardware-in-the-loop rig.
+
+## 9. What I need from you
+
+- **Decisions** (architecture §11.4): the sync budget (proposed: at most 50 µs camera-to-camera), the silicon, ring depth and bitrate as a product commitment, the lite-tier controller link.
+- **Hardware:**
+  - a camera with a working driver and a trigger input, or for the AR0234 on the bench: the right cable/adapter and its driver (G3);
+  - a logic analyzer, for the trigger at the connector pin;
+  - a second EVM and a PTP-aware switch, for several nodes;
+  - a PPS source (or a GNSS-disciplined grandmaster) and a scope, for absolute time accuracy (G2).
+- **Access:** a TI contact for the CPTS driver patch (G4) and the sensor/ISP bring-up; a kernel or image matching the SDK (board 6.12.17 vs SDK 6.12.57) to build kernel modules.
