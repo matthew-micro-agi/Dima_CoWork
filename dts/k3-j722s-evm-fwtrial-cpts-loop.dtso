@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT
+/*
+ * P-2 pre-coding check: route CPTS GENF1 (periodic output 1) back into
+ * CPTS HW3_TS_PUSH (external timestamp input 2) through the J722S timesync
+ * router, so trigd can timestamp its own trigger edges in hardware.
+ *
+ * The board's 11.0 base device tree has no timesync router node; the
+ * 11.02 SDK EVM tree enables it with exactly this entry ("MAP HW3_TS_PUSH
+ * to GENF1"). Deliberately NO "ti,pps" on the CPTS node: with it, the CPTS
+ * driver would claim GENF1 for its own PPS; without it, trigd owns GENF1.
+ *
+ * Register: 0x4 + 12*4 = 0x34 (router output 12 = CPTS HW3_TS_PUSH)
+ * Value:    0x10000 | 17 (enable | input 17 = CPTS GENF1)
+ * Needs TI's "mux-reg-masks-state" extension of the reg-mux driver
+ * (present in the board kernel 6.12.17-ti, checked).
+ *
+ * Tag: [EVM]/[TI]. Loaded by U-Boot via name_overlays in uEnv.txt.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&cbass_main {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	timesync_router: mux-controller@a40000 {
+		compatible = "reg-mux";
+		reg = <0x0 0xa40000 0x0 0x800>;
+		#mux-control-cells = <1>;
+		mux-reg-masks-state = <0x34 0x0001ffff 0x10011>;
+		status = "okay";
+	};
+};
